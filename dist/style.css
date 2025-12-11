@@ -1,0 +1,142 @@
+/* CS 1.6 Steam Theme Styling for Tauri App */
+
+/* CSS variables for CS 1.6 theme colors */
+:root {
+    --bg: #4a5942; /* Dark green background */
+    --secondary-bg: #3e4637; /* Slightly lighter green */
+    --accent: #c4b550; /* Gold/yellow accent */
+    --secondary-accent: #958831; /* Darker gold */
+    --text: #dedfd6; /* Light gray text */
+    --secondary-text: #d8ded3; /* Slightly darker gray */
+    --text-3: #a0aa95; /* Even darker gray */
+    --border-light: #8c9284; /* Light border */
+    --border-dark: #292c21; /* Dark border */
+    --disabled-text: #292c21; /* Disabled text */
+    --disabled-text-shadow: #75806f; /* Text shadow for disabled */
+    --outline: #000; /* Black outline */
+    --slider: #7f8c7f; /* Slider color */
+    --slider-bg: #1f1f1f; /* Slider background */
+    --scrollbar-track: #5a6a50; /* Scrollbar track */
+}
+
+/* General styles */
+* {
+    box-sizing: border-box;
+}
+
+body {
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 10px;
+    line-height: 1.5;
+}
+
+/* Table styles */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background-color: var(--secondary-bg);
+    margin: 10px 0;
+}
+
+th, td {
+    padding: 8px;
+    text-align: left;
+    border: 1px solid var(--border-dark);
+}
+
+th {
+    background-color: var(--bg);
+    color: var(--accent);
+    border-color: var(--border-light) var(--border-dark) var(--border-dark) var(--border-light);
+}
+
+tr.mounted {
+    background-color: var(--secondary-bg);
+}
+
+/* Button styles */
+.cs-btn {
+    background-color: var(--bg);
+    border: 1px solid;
+    border-color: var(--border-light) var(--border-dark) var(--border-dark) var(--border-light);
+    color: white;
+    font-size: 16px;
+    line-height: 15px;
+    padding: 4px 5px 3px;
+    user-select: none;
+    margin: 0 2px;
+    cursor: pointer;
+}
+
+.cs-btn:hover {
+    background-color: var(--secondary-bg);
+}
+
+.cs-btn:active {
+    border-color: var(--border-dark) var(--border-light) var(--border-light) var(--border-dark);
+}
+
+.cs-btn:disabled {
+    color: var(--disabled-text);
+    pointer-events: none;
+    text-shadow: var(--disabled-text-shadow) 1px 1px;
+}
+
+/* Status text */
+.status-text {
+    color: var(--text);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 18px;
+}
+
+::-webkit-scrollbar-track {
+    background-color: var(--scrollbar-track);
+    border: 1px solid var(--border-dark);
+    border-left: 0;
+    width: 18px;
+}
+
+::-webkit-scrollbar-thumb {
+    background-color: var(--bg);
+    border: 1px solid;
+    border-color: var(--border-light) var(--border-dark) var(--border-dark) var(--border-light);
+    width: 17px;
+}
+
+/* Header styling */
+.header-title {
+    color: var(--text);
+    font-weight: bold;
+    font-size: 18px;
+}
+
+/* Settings icon styling */
+.settings-icon {
+    cursor: pointer;
+    font-size: 18px;
+    color: var(--text-3);
+}
+
+.settings-icon:hover {
+    color: var(--accent);
+}
+
+/* Button container */
+.button-container {
+    display: flex;
+    gap: 5px;
+    margin: 10px 0;
+    flex-wrap: wrap;
+}
+
+/* Version text */
+.version-text {
+    color: var(--text-3);
+    font-size: 12px;
+}

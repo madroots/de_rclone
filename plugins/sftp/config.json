@@ -1,0 +1,61 @@
+{
+  "name": "sftp",
+  "display_name": "SFTP",
+  "description": "SFTP remote type plugin",
+  "version": "1.0.0",
+  "author": "Rclone Manager",
+  "fields": [
+    {
+      "name": "host",
+      "display_name": "Host",
+      "type": "text",
+      "required": true,
+      "placeholder": "example.com"
+    },
+    {
+      "name": "user", 
+      "display_name": "Username",
+      "type": "text",
+      "required": true,
+      "placeholder": "username"
+    },
+    {
+      "name": "port",
+      "display_name": "Port",
+      "type": "number",
+      "required": false,
+      "default": "22",
+      "placeholder": "22"
+    },
+    {
+      "name": "pass",
+      "display_name": "Password",
+      "type": "password",
+      "required": false,
+      "placeholder": "password"
+    },
+    {
+      "name": "key_file",
+      "display_name": "Private Key File",
+      "type": "file",
+      "required": false,
+      "placeholder": "/path/to/private/key"
+    },
+    {
+      "name": "use_fips_cipher",
+      "display_name": "Use FIPS cipher",
+      "type": "checkbox",
+      "required": false
+    }
+  ],
+  "validation": {
+    "host": {
+      "required": true,
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](\\.[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9])*"
+    },
+    "port": {
+      "min": 1,
+      "max": 65535
+    }
+  }
+}

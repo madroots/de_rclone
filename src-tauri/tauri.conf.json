@@ -1,0 +1,25 @@
+{
+  "productName": "Rclone Manager",
+  "version": "1.0.0",
+  "identifier": "com.rclone.manager",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Rclone Manager",
+        "width": 800,
+        "height": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false
+  },
+  "plugins": {}
+}

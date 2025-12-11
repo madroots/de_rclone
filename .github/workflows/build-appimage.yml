@@ -1,0 +1,139 @@
+name: Build Tauri AppImage
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.id }}
+      
+    steps:
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.run_number }}
+        release_name: Release ${{ github.run_number }}
+        draft: false
+        prerelease: false
+      if: github.event_name == 'release'
+
+  build-appimage:
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [x64]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install frontend dependencies
+      run: |
+        # We don't have a frontend with package.json, so we'll skip this step
+        echo "Skipping frontend dependency installation"
+
+    - name: Install Tauri CLI
+      run: |
+        cargo install tauri-cli --version 2.0.0-rc
+
+    - name: Build the app
+      run: |
+        cd src-tauri
+        cargo tauri build --release
+
+    - name: Install appimagetool
+      run: |
+        wget -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/13/appimagetool-x86_64.AppImage"
+        chmod +x appimagetool
+
+    - name: Create AppDir
+      run: |
+        mkdir -p AppDir/usr/bin
+        mkdir -p AppDir/usr/lib
+        mkdir -p AppDir/usr/share/applications
+        mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+    - name: Copy application binary
+      run: |
+        cp src-tauri/target/release/rclone-manager AppDir/usr/bin/
+
+    - name: Create AppRun script
+      run: |
+        cat > AppDir/AppRun << 'EOF'
+        #!/bin/bash
+        HERE="$(dirname "$(readlink -f "${0}")")"
+        export APPDIR="${HERE}"
+        export PATH="${HERE}/usr/bin:${HERE}/usr/lib:${PATH}"
+        export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+
+        # Run the application
+        exec "${HERE}/usr/bin/rclone-manager" "$@"
+        EOF
+        chmod +x AppDir/AppRun
+
+    - name: Create desktop entry
+      run: |
+        cat > AppDir/rclone-manager.desktop << 'EOF'
+        [Desktop Entry]
+        Type=Application
+        Name=Rclone Manager
+        Comment=Manage rclone remotes with a GUI
+        Exec=rclone-manager
+        Icon=rclone-manager
+        Terminal=false
+        Categories=Utility;FileTools;
+        EOF
+        chmod 644 AppDir/rclone-manager.desktop
+        cp AppDir/rclone-manager.desktop AppDir/usr/share/applications/
+
+    - name: Build AppImage
+      run: |
+        ARCH=x86_64 ./appimagetool --comp squashfs AppDir/
+        mv *AppImage rclone-manager-x86_64.AppImage
+
+    - name: Upload AppImage as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: rclone-manager-appimage
+        path: rclone-manager-x86_64.AppImage
+
+    - name: Upload AppImage to Release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.release_id }}
+        asset_path: ./rclone-manager-x86_64.AppImage
+        asset_name: rclone-manager-x86_64.AppImage
+        asset_content_type: application/octet-stream
+      if: github.event_name == 'release'

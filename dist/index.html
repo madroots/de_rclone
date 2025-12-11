@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Rclone Manager</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="cs16.min.css">
+    <style>
+        body {
+            margin: 0;
+            padding: 10px;
+            font-family: 'ArialPixel', system-ui, sans-serif;
+        }
+        
+        .main-container {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 20px);
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-dark);
+        }
+        
+        .header-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: var(--text);
+        }
+        
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            margin-top: 10px;
+            border-top: 1px solid var(--border-dark);
+        }
+        
+        .status-text {
+            color: var(--text);
+        }
+        
+        .version-text {
+            color: var(--text-3);
+            font-size: 12px;
+        }
+        
+        .remote-table-container {
+            flex: 1;
+            overflow: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: var(--secondary-bg);
+        }
+        
+        th, td {
+            padding: 8px;
+            text-align: left;
+            border: 1px solid var(--border-dark);
+        }
+        
+        th {
+            background-color: var(--bg);
+            color: var(--accent);
+            border-color: var(--border-light) var(--border-dark) var(--border-dark) var(--border-light);
+        }
+        
+        tr.mounted {
+            background-color: var(--secondary-bg);
+        }
+        
+        .button-container {
+            display: flex;
+            gap: 5px;
+            margin: 10px 0;
+        }
+        
+        .cs-btn {
+            margin-right: 5px;
+        }
+        
+        .settings-icon {
+            cursor: pointer;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="main-container">
+        <div class="header">
+            <div class="header-title">Rclone Remote Manager</div>
+            <div class="settings-icon" id="settings-btn">⚙️</div>
+        </div>
+        
+        <div class="button-container">
+            <button class="cs-btn" id="debug-btn">Debug Test</button>
+            <button class="cs-btn" id="config-path-btn">Show Config Path</button>
+            <button class="cs-btn" id="add-remote-btn">Add Remote</button>
+            <button class="cs-btn" id="mount-btn">Mount</button>
+            <button class="cs-btn" id="unmount-btn">Unmount</button>
+            <button class="cs-btn" id="open-btn" disabled>Open Folder</button>
+            <button class="cs-btn" id="refresh-btn">Refresh</button>
+            <button class="cs-btn" id="test-btn">Test Connection</button>
+        </div>
+        
+        <div class="remote-table-container">
+            <table id="remote-table">
+                <thead>
+                    <tr>
+                        <th>Remote</th>
+                        <th>Type</th>
+                        <th>Mounted</th>
+                        <th>Cron</th>
+                        <th>Mount Point</th>
+                    </tr>
+                </thead>
+                <tbody id="remote-table-body">
+                    <!-- Data will be populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="status-bar">
+            <div class="status-text" id="status-text">Ready</div>
+            <div class="version-text">v1.0.6</div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

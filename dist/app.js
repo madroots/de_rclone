@@ -361,9 +361,9 @@ async function mountSelected() {
 
     // Handle timeout specifically
     if (errorMessage.includes('timed out')) {
-      errorMessage = `Mount operation timed out after 30 seconds for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     } else if (errorMessage === 'undefined' || !errorMessage || errorMessage === '[object Object]') {
-      errorMessage = `Mount operation failed with unknown error for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     }
 
     showStatus(`Mount failed: ${errorMessage}`, 'error'); // Errors don't auto-reset
@@ -445,9 +445,9 @@ async function unmountSelected() {
 
     // Handle timeout specifically
     if (errorMessage.includes('timed out')) {
-      errorMessage = `Unmount operation timed out after 30 seconds for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     } else if (errorMessage === 'undefined' || !errorMessage || errorMessage === '[object Object]') {
-      errorMessage = `Unmount operation failed with unknown error for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     }
 
     showStatus(`Unmount failed: ${errorMessage}`, 'error'); // Errors don't auto-reset
@@ -558,9 +558,9 @@ async function testSelected() {
 
     // Handle timeout specifically
     if (errorMessage.includes('timed out')) {
-      errorMessage = `Connection test timed out after 10 seconds for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     } else if (errorMessage === 'undefined' || !errorMessage || errorMessage === '[object Object]') {
-      errorMessage = `Connection test failed with unknown error for remote: ${remoteName}`;
+      errorMessage = `Unable to connect to remote: ${remoteName}`;
     }
 
     showStatus(`Test failed: ${errorMessage}`, 'error'); // Errors don't auto-reset
@@ -589,7 +589,7 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
       <div class="progress-body">
         <div class="progress-message">${operationMessage}</div>
         <div class="progress-content">
-          <div class="cs-progress-bar">
+          <div class="cs-progress-bar" style="flex: 1;">
             <div class="bars" style="width: 1%"></div>
           </div>
           <button class="cs-btn progress-cancel-btn">${cancelText}</button>
@@ -627,16 +627,21 @@ function updateProgressModal(modal, title, message, buttonText, resultType) {
   const titleElement = modal.querySelector('.progress-title');
   const messageElement = modal.querySelector('.progress-message');
   const cancelButton = modal.querySelector('.progress-cancel-btn');
+  const progressBar = modal.querySelector('.bars'); // Get the progress bar element (the .bars inside .cs-progress-bar)
 
   titleElement.textContent = title;
   messageElement.textContent = message;
   cancelButton.textContent = buttonText;
 
-  // Remove the progress bar as it's no longer needed
-  const progressBar = modal.querySelector('.progress-bar');
+  // Make the progress bar jump to 100% in all scenarios and keep it visible
   if (progressBar) {
-    progressBar.style.display = 'none';
+    progressBar.style.width = '100%';
   }
+  // Mark the operation as completed to stop the animation
+  if (modal.operation) {
+    modal.operation.completed = true;
+  }
+  // Keep the progress bar visible - don't hide it in any scenario
 
   // Add appropriate styling based on result type
   const content = modal.querySelector('.progress-modal-content');
@@ -648,14 +653,9 @@ function updateProgressModal(modal, title, message, buttonText, resultType) {
     modal.remove();
   };
 
-  // If this is a success message, set a timeout to close the modal after 2 seconds
-  if (resultType === 'test-success' || resultType === 'mount-success' || resultType === 'unmount-success') {
-    setTimeout(() => {
-      if (document.contains(modal)) { // Check if modal still exists
-        modal.remove();
-      }
-    }, 2000);
-  }
+  // DO NOT auto-close modal on success - user must close it manually
+  // The modal will only auto-close for success after a delay if you want that behavior
+  // Currently, we keep the modal open until the user closes it manually
 }
 
 // Randomized progress bar simulation - reaches 100% in exactly 10 seconds
@@ -684,14 +684,14 @@ function animateProgressBar(modal) {
 
   // Process each step with delays
   const processStep = () => {
-    if (stepIndex >= progressPattern.length || !document.contains(modal) || modal.operation?.cancelled) {
-      return; // Done or cancelled
+    if (stepIndex >= progressPattern.length || !document.contains(modal) || modal.operation?.cancelled || modal.operation?.completed) {
+      return; // Done, cancelled, or completed
     }
 
     const step = progressPattern[stepIndex];
 
     setTimeout(() => {
-      if (!document.contains(modal) || modal.operation?.cancelled) {
+      if (!document.contains(modal) || modal.operation?.cancelled || modal.operation?.completed) {
         return;
       }
 

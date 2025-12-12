@@ -102,12 +102,19 @@
 .progress-content {
   display: flex;
   align-items: center;
-  gap: 8px; /* Smaller gap between progress bar and button */
-  padding: 8px 0; /* Reduced padding for less vertical space */
+  gap: 6px; /* Increased gap between progress bar and button */
+  padding: 4px 0 8px 0; /* Added more bottom padding for better aesthetics */
 }
+
 
 .progress-message {
   color: var(--text-3); /* Less bright white color */
-  margin-bottom: 8px; /* Reduced space between message and progress bar */
+  margin-bottom: 4px; /* Reduced space between message and progress bar */
   margin-top: 0;
+}
+
+/* Ensure consistent button sizing in progress modal */
+.progress-content .cs-btn {
+  min-width: 72px;
+  text-align: center;
 }

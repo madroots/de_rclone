@@ -290,11 +290,7 @@ function showStatus(message, type = 'info', autoReset = true) {
 // Mount selected remote
 async function mountSelected() {
   if (!selectedRemote) {
-    if (dialog) {
-      await dialog.message('Please select a remote to mount', { title: 'Warning', type: 'warning' });
-    } else {
-      alert('Please select a remote to mount');
-    }
+    showGeneralModal('Warning', 'Please select a remote to mount');
     return;
   }
 
@@ -305,9 +301,9 @@ async function mountSelected() {
   const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Cancel', remoteName, 'mount');
 
   try {
-    // Create a timeout promise that rejects after 30 seconds for mount operations (changed from 60)
+    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Mount operation timed out after 30 seconds')), 30000);
+      setTimeout(() => reject(new Error('Mount operation timed out after 10 seconds')), 10000);
     });
 
     // Race the invoke call with the timeout
@@ -374,11 +370,7 @@ async function mountSelected() {
 // Unmount selected remote
 async function unmountSelected() {
   if (!selectedRemote) {
-    if (dialog) {
-      await dialog.message('Please select a remote to unmount', { title: 'Warning', type: 'warning' });
-    } else {
-      alert('Please select a remote to unmount');
-    }
+    showGeneralModal('Warning', 'Please select a remote to unmount');
     return;
   }
 
@@ -389,9 +381,9 @@ async function unmountSelected() {
   const modal = showProgressDialog(`Unmounting ${remoteName}...`, 'Cancel', remoteName, 'unmount');
 
   try {
-    // Create a timeout promise that rejects after 30 seconds for unmount operations
+    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Unmount operation timed out after 30 seconds')), 30000);
+      setTimeout(() => reject(new Error('Unmount operation timed out after 10 seconds')), 10000);
     });
 
     // Race the invoke call with the timeout
@@ -458,11 +450,7 @@ async function unmountSelected() {
 // Open selected remote folder
 async function openSelected() {
   if (!selectedRemote || selectedRemote.mounted !== 'Yes') {
-    if (dialog) {
-      await dialog.message('Please select a mounted remote to open', { title: 'Warning', type: 'warning' });
-    } else {
-      alert('Please select a mounted remote to open');
-    }
+    showGeneralModal('Warning', 'Please select a mounted remote to open');
     return;
   }
 
@@ -474,11 +462,7 @@ async function openSelected() {
   } catch (error) {
     console.error('Error opening folder:', error);
     showStatus(`Error opening folder: ${error.message}`, 'error'); // Errors don't auto-reset
-    if (dialog) {
-      await dialog.message(`Error opening folder: ${error.message}`, { title: 'Error', type: 'error' });
-    } else {
-      alert(`Error opening folder: ${error.message}`);
-    }
+    showGeneralModal('Error', `Error opening folder: ${error.message}`);
   }
 }
 
@@ -488,11 +472,7 @@ let currentOperationId = null;
 // Test selected remote connection
 async function testSelected() {
   if (!selectedRemote) {
-    if (dialog) {
-      await dialog.message('Please select a remote to test', { title: 'Warning', type: 'warning' });
-    } else {
-      alert('Please select a remote to test');
-    }
+    showGeneralModal('Warning', 'Please select a remote to test');
     return;
   }
 
@@ -613,7 +593,8 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
   cancelBtn.addEventListener('click', () => {
     modal.operation.cancelled = true;
     cancelCurrentOperation();
-    // The modal will be updated by the calling function when the operation is cancelled
+    // Update the modal immediately to show cancellation
+    updateProgressModal(modal, 'Cancelled', 'Operation was cancelled', 'OK', 'cancelled');
   });
 
   // Start the progress bar animation
@@ -724,52 +705,72 @@ function resetOperationCancellation() {
 
 // Open settings
 async function openSettings() {
-  // Create a simple settings dialog with configurable options
-  const settingsHtml = `
-    <div style="padding: 20px; background: var(--bg); color: var(--text);">
-      <h3>Settings</h3>
-      <div style="margin: 10px 0;">
-        <label>Config Path:</label>
-        <input type="text" id="config-path" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;" value="${localStorage.getItem('rcloneConfigPath') || ''}">
+  // Create modal div with consistent styling
+  const modal = document.createElement('div');
+  modal.id = 'settings-modal';
+  modal.className = 'progress-modal'; // Use same overlay style as other modals
+
+  modal.innerHTML = `
+    <div class="progress-modal-content">
+      <div class="progress-header">
+        <span class="progress-title">Settings</span>
       </div>
-      <div style="margin: 10px 0;">
-        <label>Theme:</label>
-        <select id="theme-select" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); padding: 5px;">
-          <option value="cs16">CS 1.6 Steam</option>
-        </select>
-      </div>
-      <div style="margin: 15px 0; text-align: right;">
-        <button class="cs-btn" id="settings-ok-btn">OK</button>
-        <button class="cs-btn" id="settings-cancel-btn" style="margin-left: 5px;">Cancel</button>
+      <div class="progress-body">
+        <div style="margin: 10px 0;">
+          <label class="cs-input__label">Config Path:</label>
+          <div style="display: flex; gap: 4px; align-items: center;">
+            <input type="text" id="config-path" class="cs-input" style="flex: 1; margin: 4px 0;" value="${localStorage.getItem('rcloneConfigPath') || ''}" placeholder="~/.config/rclone/rclone.conf">
+            <button class="cs-btn" id="browse-config-btn" style="white-space: nowrap;">Browse...</button>
+          </div>
+        </div>
+        <fieldset class="cs-fieldset" style="margin: 10px 0;">
+          <legend class="cs-input__label">Theme:</legend>
+          <div style="margin-top: 4px;">
+            <input type="radio" id="theme-cs16" name="theme" value="cs16" ${localStorage.getItem('theme') === 'cs16' ? 'checked' : ''}>
+            <label for="theme-cs16">CS 1.6 Steam</label>
+          </div>
+        </fieldset>
+        <div class="progress-content" style="justify-content: flex-end; padding-top: 15px;">
+          <button class="cs-btn settings-modal-cancel-btn">Cancel</button>
+          <button class="cs-btn settings-modal-ok-btn" style="margin-left: 5px;">OK</button>
+        </div>
       </div>
     </div>
   `;
 
-  // Create modal div
-  const modal = document.createElement('div');
-  modal.id = 'settings-modal';
-  modal.innerHTML = settingsHtml;
-  modal.style.position = 'fixed';
-  modal.style.top = '50%';
-  modal.style.left = '50%';
-  modal.style.transform = 'translate(-50%, -50%)';
-  modal.style.backgroundColor = 'var(--bg)';
-  modal.style.border = '1px solid var(--border-light)';
-  modal.style.padding = '20px';
-  modal.style.zIndex = '1000';
-  modal.style.width = '400px';
-
   document.body.appendChild(modal);
 
   // Add event listeners for the buttons
-  document.getElementById('settings-ok-btn').addEventListener('click', () => {
+  modal.querySelector('.settings-modal-ok-btn').addEventListener('click', () => {
     const newPath = document.getElementById('config-path').value;
     localStorage.setItem('rcloneConfigPath', newPath);
-    document.getElementById('settings-modal').remove();
+    // Save theme selection if needed
+    const selectedTheme = document.querySelector('input[name="theme"]:checked').value;
+    localStorage.setItem('theme', selectedTheme);
+    modal.remove();
   });
 
-  document.getElementById('settings-cancel-btn').addEventListener('click', () => {
-    document.getElementById('settings-modal').remove();
+  modal.querySelector('.settings-modal-cancel-btn').addEventListener('click', () => {
+    modal.remove();
+  });
+
+  // Add event listener for the browse button
+  modal.querySelector('#browse-config-btn').addEventListener('click', async () => {
+    try {
+      // Use Tauri's file dialog to select a file
+      const selectedPath = await invoke('dialog_open_file', {
+        filters: [{ name: 'Config Files', extensions: ['conf'] }],
+        multiple: false,
+        directory: false
+      });
+      if (selectedPath) {
+        document.getElementById('config-path').value = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
+      }
+    } catch (error) {
+      console.error('Error opening file dialog:', error);
+      // Show an info message since Tauri dialog may not be available in this context
+      showGeneralModal('Info', 'File browsing requires direct Tauri API access. Please enter the path manually.');
+    }
   });
 }
 
@@ -780,14 +781,7 @@ async function addRemote() {
     const plugins = await invoke('get_available_plugins');
 
     if (plugins.length === 0) {
-      if (dialog) {
-        await dialog.message('No remote plugins available. You can configure remotes using rclone config directly.', {
-          title: 'No Plugins Available',
-          type: 'info'
-        });
-      } else {
-        alert('No remote plugins available. You can configure remotes using rclone config directly.');
-      }
+      showGeneralModal('No Plugins Available', 'No remote plugins available. You can configure remotes using rclone config directly.');
       return;
     }
 
@@ -888,11 +882,7 @@ async function addRemote() {
       const remoteName = document.getElementById('remote-name').value.trim();
 
       if (!remoteName) {
-        if (dialog) {
-          await dialog.message('Please enter a remote name', { title: 'Error', type: 'error' });
-        } else {
-          alert('Please enter a remote name');
-        }
+        showGeneralModal('Error', 'Please enter a remote name');
         return;
       }
 
@@ -900,11 +890,7 @@ async function addRemote() {
       const plugins = await invoke('get_available_plugins');
       const plugin = plugins.find(p => p.name === remoteType);
       if (!plugin) {
-        if (dialog) {
-          await dialog.message('Invalid plugin selected', { title: 'Error', type: 'error' });
-        } else {
-          alert('Invalid plugin selected');
-        }
+        showGeneralModal('Error', 'Invalid plugin selected');
         return;
       }
 
@@ -931,27 +917,15 @@ async function addRemote() {
         });
 
         if (result.success) {
-          if (dialog) {
-            await dialog.message(result.message, { title: 'Success', type: 'info' });
-          } else {
-            alert(result.message);
-          }
+          showGeneralModal('Success', result.message);
           document.getElementById('add-remote-modal').remove();
           await loadRemotes(); // Refresh the list
         } else {
-          if (dialog) {
-            await dialog.message(result.message, { title: 'Failed', type: 'error' });
-          } else {
-            alert(result.message);
-          }
+          showGeneralModal('Failed', result.message);
         }
       } catch (error) {
         console.error('Error adding remote:', error);
-        if (dialog) {
-          await dialog.message(`Failed to add remote: ${error.message}`, { title: 'Error', type: 'error' });
-        } else {
-          alert(`Failed to add remote: ${error.message}`);
-        }
+        showGeneralModal('Error', `Failed to add remote: ${error.message}`);
       }
     });
 
@@ -964,59 +938,60 @@ async function addRemote() {
     document.getElementById('remote-type').dispatchEvent(new Event('change'));
   } catch (error) {
     console.error('Error getting plugins:', error);
-    if (dialog) {
-      await dialog.message('Error getting remote types: ' + error.message, {
-        title: 'Error',
-        type: 'error'
-      });
-    } else {
-      alert('Error getting remote types: ' + error.message);
-    }
+    showGeneralModal('Error', 'Error getting remote types: ' + error.message);
   }
 }
 
 // Debug test function
 async function debugTest() {
   try {
-    // Test with a simple hello world dialog
-    if (dialog) {
-      await dialog.message('Hello World! Debug test successful.', { title: 'Debug Test', type: 'info' });
-    } else {
-      alert('Hello World! Debug test successful.');
-    }
+    showGeneralModal('Debug Test', 'Hello World! Debug test successful.');
   } catch (error) {
     console.error('Debug test error:', error);
-    if (dialog) {
-      await dialog.message(`Debug test failed: ${error.message}`, { title: 'Debug Error', type: 'error' });
-    } else {
-      alert(`Debug test failed: ${error.message}`);
-    }
+    showGeneralModal('Debug Error', `Debug test failed: ${error.message}`);
   }
 }
 
 // Show config path function
 async function showConfigPath() {
   try {
-    // Create a dialog showing the expected config path
-    if (dialog) {
-      await dialog.message('Expected config path: ~/.config/rclone/rclone.conf', {
-        title: 'Config Path Info',
-        type: 'info'
-      });
-    } else {
-      alert('Expected config path: ~/.config/rclone/rclone.conf');
-    }
+    showGeneralModal('Config Path Info', 'Expected config path: ~/.config/rclone/rclone.conf');
   } catch (error) {
     console.error('Config path error:', error);
-    if (dialog) {
-      await dialog.message(`Error showing config path: ${error.message}`, {
-        title: 'Config Path Error',
-        type: 'error'
-      });
-    } else {
-      alert(`Error showing config path: ${error.message}`);
-    }
+    showGeneralModal('Config Path Error', `Error showing config path: ${error.message}`);
   }
+}
+
+// Show general purpose modal dialog
+function showGeneralModal(title, message, buttonText = 'OK', resultType = 'info') {
+  // Create modal div
+  const modal = document.createElement('div');
+  modal.id = 'general-modal';
+  modal.className = 'progress-modal'; // Use same overlay style as progress modal
+
+  modal.innerHTML = `
+    <div class="progress-modal-content">
+      <div class="progress-header">
+        <span class="progress-title">${title}</span>
+      </div>
+      <div class="progress-body">
+        <div class="progress-message">${message}</div>
+        <div class="progress-content" style="justify-content: flex-end; padding-top: 10px;">
+          <button class="cs-btn general-modal-btn">${buttonText}</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // Add event listener for the button
+  const okBtn = modal.querySelector('.general-modal-btn');
+  okBtn.addEventListener('click', () => {
+    modal.remove();
+  });
+
+  return modal;
 }
 
 // Export functions for Tauri commands to use if needed

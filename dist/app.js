@@ -1,4 +1,4 @@
-// Rclone Manager - Tauri v2 API Interface
+// de_rclone - Tauri v2 API Interface
 // Global variables for Tauri functions
 let invoke, dialog;
 
@@ -13,7 +13,7 @@ let isOperationInProgress = false;
 
 // Initialize the app when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-  console.log("Rclone Manager: Initializing app...");
+  console.log("de_rclone: Initializing app...");
 
   // Initialize Tauri API functions
   initializeTauriAPI();

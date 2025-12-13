@@ -1,14 +1,14 @@
 {
-  "productName": "Rclone Manager",
+  "productName": "de_rclone",
   "version": "1.0.0",
-  "identifier": "com.rclone.manager",
+  "identifier": "com.derclone.manager",
   "build": {
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "Rclone Manager",
+        "title": "de_rclone",
         "width": 800,
         "height": 600,
         "resizable": true
@@ -19,7 +19,8 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["appimage"]
   },
   "plugins": {}
 }

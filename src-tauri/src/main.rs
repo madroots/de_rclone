@@ -644,7 +644,7 @@ fn main() {
         .setup(|app| {
             // Set window title - add error handling
             if let Some(window) = app.get_webview_window("main") {
-                if let Err(e) = window.set_title("Rclone Manager") {
+                if let Err(e) = window.set_title("de_rclone") {
                     eprintln!("Failed to set window title: {}", e);
                 }
             } else {

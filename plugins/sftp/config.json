@@ -3,7 +3,7 @@
   "display_name": "SFTP",
   "description": "SFTP remote type plugin",
   "version": "1.0.0",
-  "author": "Rclone Manager",
+  "author": "de_rclone",
   "fields": [
     {
       "name": "host",

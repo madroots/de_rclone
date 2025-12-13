@@ -3,7 +3,7 @@
 
 set -e  # Exit on any error
 
-echo "Building Tauri Rclone Manager AppImage..."
+echo "Building Tauri de_rclone AppImage..."
 
 # Create build directory
 mkdir -p build
@@ -13,19 +13,21 @@ echo "Installing tauri-cli if not already installed..."
 cargo install tauri-cli --version 2.9.6
 
 echo "Building the Tauri application..."
+cd ../src-tauri
 cargo tauri build
+cd ../..
 
 echo "Creating AppImage structure..."
-mkdir -p AppDir/usr/bin
-mkdir -p AppDir/usr/lib
-mkdir -p AppDir/usr/share/applications
-mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+mkdir -p build/AppDir/usr/bin
+mkdir -p build/AppDir/usr/lib
+mkdir -p build/AppDir/usr/share/applications
+mkdir -p build/AppDir/usr/share/icons/hicolor/256x256/apps
 
 echo "Copying application binary..."
-cp ../src-tauri/target/release/rclone-manager AppDir/usr/bin/
+cp ../src-tauri/target/release/rclone-manager build/AppDir/usr/bin/
 
 echo "Creating AppRun script..."
-cat > AppDir/AppRun << 'EOF'
+cat > build/AppDir/AppRun << 'EOF'
 #!/bin/bash
 HERE="$(dirname "$(readlink -f "${0}")")"
 export APPDIR="${HERE}"
@@ -36,29 +38,29 @@ export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
 exec "${HERE}/usr/bin/rclone-manager" "$@"
 EOF
 
-chmod +x AppDir/AppRun
+chmod +x build/AppDir/AppRun
 
 echo "Creating desktop entry..."
-cat > AppDir/rclone-manager.desktop << 'EOF'
+cat > build/AppDir/rclone-manager.desktop << 'EOF'
 [Desktop Entry]
 Type=Application
-Name=Rclone Manager
-Comment=Manage rclone remotes with a GUI
+Name=de_rclone
+Comment=A CS16-style rclone GUI manager
 Exec=rclone-manager
 Icon=rclone-manager
 Terminal=false
 Categories=Utility;FileTools;
 EOF
 
-chmod 644 AppDir/rclone-manager.desktop
+chmod 644 build/AppDir/rclone-manager.desktop
 
 echo "Copying desktop entry to applications folder..."
-cp AppDir/rclone-manager.desktop AppDir/usr/share/applications/
+cp build/AppDir/rclone-manager.desktop build/AppDir/usr/share/applications/
 
 echo "Creating icon placeholder (to be replaced with actual icon)..."
 # For now, just create a placeholder, but in a real scenario we'd copy an actual icon
-echo "Icon placeholder" > AppDir/rclone-manager.png
-cp AppDir/rclone-manager.png AppDir/usr/share/icons/hicolor/256x256/apps/rclone-manager.png
+echo "Icon placeholder" > build/AppDir/rclone-manager.png
+cp build/AppDir/rclone-manager.png build/AppDir/usr/share/icons/hicolor/256x256/apps/rclone-manager.png
 
 echo "Building AppImage using appimagetool..."
 
@@ -70,11 +72,11 @@ if ! command -v appimagetool &> /dev/null; then
 fi
 
 # Run appimagetool to create the AppImage
-ARCH=x86_64 ./appimagetool --comp squashfs AppDir/
+ARCH=x86_64 ./appimagetool --comp squashfs build/AppDir/
 
 # Rename the resulting AppImage
-if [ -f "Rclone_Manager-*.AppImage" ]; then
-    mv Rclone_Manager-*.AppImage rclone-manager.AppImage
+if [ -f "de_rclone-*.AppImage" ]; then
+    mv de_rclone-*.AppImage rclone-manager.AppImage
 elif [ -f "rclone-manager-*.AppImage" ]; then
     mv rclone-manager-*.AppImage rclone-manager.AppImage
 elif ls *.AppImage 1> /dev/null 2>&1; then
@@ -87,7 +89,6 @@ echo "AppImage build complete!"
 echo "AppImage is located at: $(pwd)/rclone-manager.AppImage"
 
 # Create a symbolic link to the root directory for easy access
-cd ..
-ln -sf build/rclone-manager.AppImage . || true
+ln -sf rclone-manager.AppImage .. || true
 
 echo "Build process finished successfully!"

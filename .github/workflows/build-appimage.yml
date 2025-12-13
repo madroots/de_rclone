@@ -106,8 +106,8 @@ jobs:
         cat > AppDir/rclone-manager.desktop << 'EOF'
         [Desktop Entry]
         Type=Application
-        Name=Rclone Manager
-        Comment=Manage rclone remotes with a GUI
+        Name=de_rclone
+        Comment=A CS16-style rclone GUI manager
         Exec=rclone-manager
         Icon=rclone-manager
         Terminal=false

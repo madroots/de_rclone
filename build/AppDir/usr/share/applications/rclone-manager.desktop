@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rclone Manager
+Comment=Manage rclone remotes with a GUI
+Exec=rclone-manager
+Icon=rclone-manager
+Terminal=false
+Categories=Utility;FileTools;

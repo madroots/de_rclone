@@ -1,3 +1,11 @@
+/* Load local ArialPixel font */
+@font-face {
+  font-family: 'ArialPixel';
+  src: url('./ArialPixel.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+}
+
 /* Minimal custom styles to preserve de_rclone functionality while using cs16.css as primary */
 
 /* Main container styling - structural CSS only */

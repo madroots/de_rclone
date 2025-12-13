@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- saved from url=(0047)https://docs.rs/-/storage-change-detection.html -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+        
+        <!--
+            Only other windows get notified when we change local storage, so
+            this is used in an invisible iframe to send a message to JS in
+            ../templates/theme.js when rustdoc in the current window changes the
+            theme
+        -->
+        <script nonce="" type="text/javascript">
+            onstorage = function(ev) {
+                parent.postMessage({
+                    storage: {
+                        key: ev.key,
+                        value: ev.newValue,
+                    }
+                })
+            }
+        </script>
+    </head>
+<body></body></html>

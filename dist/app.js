@@ -3,7 +3,7 @@
 let invoke, dialog;
 
 // DOM elements
-let remoteTableBody, mountBtn, unmountBtn, openBtn, refreshBtn, testBtn, addRemoteBtn, debugBtn, configPathBtn, statusText, settingsBtn;
+let remoteTableBody, mountBtn, unmountBtn, openBtn, refreshBtn, testBtn, addRemoteBtn, configPathBtn, statusText, settingsBtn;
 
 // Currently selected remote
 let selectedRemote = null;
@@ -41,29 +41,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Initialize Tauri API functions properly for v2
 function initializeTauriAPI() {
-  // In Tauri v2, the invoke function should be available via import
-  // Try to access it directly from the global Tauri object
-  if (window.__TAURI_INTERNALS__) {
-    // Tauri v2 approach
-    invoke = window.__TAURI_INTERNALS__.invoke;
-    dialog = window.__TAURI_INTERNALS__.dialog;
-    console.log("Tauri v2 APIs initialized via __TAURI_INTERNALS__");
-  } else if (window.__TAURI_INVOKE__) {
-    // Alternative for Tauri v2
+  // Tauri v2 uses global APIs that are available in the window object
+  if (window.__TAURI_INVOKE__) {
+    console.log("Tauri v2 API available via __TAURI_INVOKE__");
     invoke = window.__TAURI_INVOKE__;
-    dialog = {
-      message: async (message, options) => {
-        return invoke('dialog_message', {
-          message: message,
-          title: options?.title || 'Message',
-          type: options?.type || 'info'
-        });
-      }
-    };
-    console.log("Tauri v2 APIs initialized via __TAURI_INVOKE__");
+  } else if (typeof window.tauri !== 'undefined' && window.tauri.invoke) {
+    // Alternative Tauri v2 approach
+    console.log("Tauri API available via window.tauri");
+    invoke = window.tauri.invoke;
+  } else if (window.__TAURI_INTERNALS__?.invoke) {
+    console.log("Tauri API available via __TAURI_INTERNALS__");
+    invoke = window.__TAURI_INTERNALS__.invoke;
   } else {
     console.error("Tauri APIs not found in global scope!");
-    
+    console.log("Available globals:", Object.keys(window).filter(key => key.includes('TAURI')));
+
     // Mock functions as fallback for testing
     invoke = async (cmd, args) => {
       console.log(`[MOCK] invoke: ${cmd}`, args);
@@ -71,12 +63,6 @@ function initializeTauriAPI() {
         return [];
       }
       return { success: true, message: `[MOCK] Response from ${cmd}` };
-    };
-    dialog = {
-      message: async (message, options) => {
-        console.log(`[MOCK] dialog: ${message}`, options);
-        alert(`${options?.title || 'Message'}: ${message}`);
-      }
     };
   }
 }
@@ -127,7 +113,6 @@ function setupEventListeners() {
     });
   }
 
-
   if (settingsBtn) {
     settingsBtn.addEventListener('click', () => {
       console.log("Settings button clicked");
@@ -142,8 +127,10 @@ async function loadRemotes() {
     console.log("Loading remotes...");
     showStatus('Loading remotes...', 'info');
 
-    const remotes = await invoke('get_remotes');
-    console.log("Remotes loaded:", remotes);
+    // Get the config path from localStorage or use default
+    const configPath = localStorage.getItem('rcloneConfigPath');
+    const configPathFinal = configPath || null;
+    const remotes = await invoke('get_remotes', { configPathOpt: configPathFinal });
 
     renderRemotesTable(remotes);
     const message = `Loaded ${remotes.length} remotes`;
@@ -151,15 +138,21 @@ async function loadRemotes() {
     showStatus(message, 'success', false); // Don't auto-reset the loaded message
   } catch (error) {
     console.error('Error loading remotes:', error);
-    const errorMessage = `Error loading remotes: ${error.message}`;
-    defaultStatusMessage = "Ready"; // Reset to ready state on error
-    showStatus(errorMessage, 'error');
+    // Handle error safely to avoid undefined error.message
+    const errorMessage = error && typeof error === 'object' && error.message ? error.message : String(error);
+    const displayMessage = `Error loading remotes: ${errorMessage}`;
+    // Don't reset defaultStatusMessage if it's the config not found specific message
+    if (!errorMessage.includes("rclone.conf not found")) {
+      defaultStatusMessage = "Ready"; // Reset to ready state on other errors
+    }
+    showStatus(displayMessage, 'error');
 
     // Specific error message for common issues
-    if (error.message.includes("rclone.conf not found")) {
-      showStatus("Rclone config not found. Run 'rclone config' to configure remotes.", 'error');
-    } else if (error.message.includes("Failed to read config")) {
-      showStatus("Could not read rclone config. Check ~/.config/rclone/rclone.conf", 'error');
+    if (errorMessage && errorMessage.includes("rclone.conf not found")) {
+      showStatus("rclone.conf not found. Select it from settings or add a new remote to create it.", 'warning', false); // Yellow and doesn't auto-reset
+      defaultStatusMessage = "rclone.conf not found. Select it from settings or add a new remote to create it."; // Keep this as the persistent message
+    } else if (errorMessage && errorMessage.includes("Failed to read config")) {
+      showStatus("Could not read rclone config. Check ~/.config/rclone/rclone.conf", 'warning', false); // Yellow and doesn't auto-reset
     }
   }
 }
@@ -306,9 +299,11 @@ async function mountSelected() {
       setTimeout(() => reject(new Error('Mount operation timed out after 10 seconds')), 10000);
     });
 
+    // Get the config path from localStorage or use default (null)
+    const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('mount_remote', { remoteName }),
+      invoke('mount_remote', { remoteName, configPathOpt: configPath }),
       timeoutPromise
     ]);
 
@@ -386,9 +381,11 @@ async function unmountSelected() {
       setTimeout(() => reject(new Error('Unmount operation timed out after 10 seconds')), 10000);
     });
 
+    // Get the config path from localStorage or use default (null)
+    const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('unmount_remote', { remoteName }),
+      invoke('unmount_remote', { remoteName, configPathOpt: configPath }),
       timeoutPromise
     ]);
 
@@ -488,9 +485,11 @@ async function testSelected() {
       setTimeout(() => reject(new Error('Test connection timed out after 10 seconds')), 10000);
     });
 
+    // Get the config path from localStorage or use default (null)
+    const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('test_connection', { remoteName }),
+      invoke('test_connection', { remoteName, configPathOpt: configPath }),
       timeoutPromise
     ]);
 
@@ -745,9 +744,18 @@ async function openSettings() {
     const newPath = document.getElementById('config-path').value;
     localStorage.setItem('rcloneConfigPath', newPath);
     // Save theme selection if needed
-    const selectedTheme = document.querySelector('input[name="theme"]:checked').value;
-    localStorage.setItem('theme', selectedTheme);
+    const selectedThemeElement = document.querySelector('input[name="theme"]:checked');
+    if (selectedThemeElement) {
+      const selectedTheme = selectedThemeElement.value;
+      localStorage.setItem('theme', selectedTheme);
+    }
     modal.remove();
+
+    // Reload remotes after updating config path
+    loadRemotes().catch(error => {
+      console.error('Failed to reload remotes after config path update:', error);
+      showStatus(`Failed to reload remotes: ${error.message || error}`, 'error');
+    });
   });
 
   modal.querySelector('.settings-modal-cancel-btn').addEventListener('click', () => {
@@ -757,14 +765,11 @@ async function openSettings() {
   // Add event listener for the browse button
   modal.querySelector('#browse-config-btn').addEventListener('click', async () => {
     try {
-      // Use Tauri's file dialog to select a file
-      const selectedPath = await invoke('dialog_open_file', {
-        filters: [{ name: 'Config Files', extensions: ['conf'] }],
-        multiple: false,
-        directory: false
-      });
-      if (selectedPath) {
-        document.getElementById('config-path').value = Array.isArray(selectedPath) ? selectedPath[0] : selectedPath;
+      // Use the custom Tauri v2 dialog command
+      const fileResponse = await invoke('open_file_dialog', {});
+
+      if (fileResponse) {
+        document.getElementById('config-path').value = fileResponse;
       }
     } catch (error) {
       console.error('Error opening file dialog:', error);
@@ -911,9 +916,12 @@ async function addRemote() {
       });
 
       try {
+        // Get the config path from localStorage or use default (null)
+        const configPath = localStorage.getItem('rcloneConfigPath') || null;
         const result = await invoke('add_remote_with_plugin', {
           pluginName: remoteType,
-          config: config
+          config: config,
+          configPathOpt: configPath
         });
 
         if (result.success) {

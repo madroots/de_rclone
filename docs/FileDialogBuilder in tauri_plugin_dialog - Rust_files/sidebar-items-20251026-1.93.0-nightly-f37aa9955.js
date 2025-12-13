@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Error","FilePath","MessageDialogButtons","MessageDialogKind","MessageDialogResult"],"fn":["init"],"struct":["Dialog","FileDialogBuilder","MessageDialogBuilder"],"trait":["DialogExt"],"type":["Result"]};

@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::fs;
 use std::io::Write;
-use tauri::Manager;
+use tauri::{Manager};
+use tauri_plugin_dialog::DialogExt;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 struct Remote {
@@ -50,10 +52,17 @@ struct Plugin {
 
 // Get all rclone remotes
 #[tauri::command]
-async fn get_remotes() -> Result<Vec<Remote>, String> {
-    // Check if rclone config exists - use direct path for debug
-    let home_dir = std::env::var("HOME").map_err(|e| format!("HOME not set: {}", e))?;
-    let config_path = std::path::PathBuf::from(&home_dir).join(".config").join("rclone").join("rclone.conf");
+async fn get_remotes(config_path_opt: Option<String>) -> Result<Vec<Remote>, String> {
+    // Use the provided config path or default to ~/.config/rclone/rclone.conf
+    let config_path = if let Some(path_str) = config_path_opt {
+        expand_tilde_path(&path_str)?
+    } else {
+        // Use the default path
+        let home_dir = std::env::var("HOME").map_err(|e| format!("HOME not set: {}", e))?;
+        std::path::PathBuf::from(&home_dir).join(".config").join("rclone").join("rclone.conf")
+    };
+
+    println!("Looking for config at path: {:?}", config_path); // Debug log
 
     if !config_path.exists() {
         return Err(format!("rclone.conf not found at {:?}", config_path));
@@ -132,7 +141,7 @@ async fn get_remotes() -> Result<Vec<Remote>, String> {
 
 // Mount a remote
 #[tauri::command]
-async fn mount_remote(remote_name: String) -> Result<CommandResult, String> {
+async fn mount_remote(remote_name: String, config_path_opt: Option<String>) -> Result<CommandResult, String> {
     let mount_point = get_mount_dir(&remote_name);
 
     // Check if already mounted
@@ -148,16 +157,22 @@ async fn mount_remote(remote_name: String) -> Result<CommandResult, String> {
         .map_err(|e| format!("Failed to create mount directory: {}", e))?;
 
     // Execute rclone mount command
-    let output = Command::new("rclone")
-        .args(&[
-            "mount",
-            &format!("{}:", remote_name),
-            &mount_point,
-            "--vfs-cache-mode",
-            "writes",
-            "--daemon",  // Run in background
-        ])
-        .output()
+    let mut cmd = Command::new("rclone");
+    cmd.args(&[
+        "mount",
+        &format!("{}:", remote_name),
+        &mount_point,
+        "--vfs-cache-mode",
+        "writes",
+        "--daemon",  // Run in background
+    ]);
+
+    if let Some(config_path_str) = config_path_opt {
+        let expanded_config_path = expand_tilde_path(&config_path_str)?;
+        cmd.arg("--config").arg(expanded_config_path);
+    }
+
+    let output = cmd.output()
         .map_err(|e| format!("Failed to execute rclone mount: {}", e))?;
 
     if output.status.success() {
@@ -173,7 +188,7 @@ async fn mount_remote(remote_name: String) -> Result<CommandResult, String> {
 
 // Unmount a remote
 #[tauri::command]
-async fn unmount_remote(remote_name: String) -> Result<CommandResult, String> {
+async fn unmount_remote(remote_name: String, _config_path_opt: Option<String>) -> Result<CommandResult, String> {
     let mount_point = get_mount_dir(&remote_name);
 
     if !is_mounted(&mount_point) {
@@ -183,7 +198,7 @@ async fn unmount_remote(remote_name: String) -> Result<CommandResult, String> {
         });
     }
 
-    // Try fusermount first (Linux)
+    // Try fusermount first (Linux) - this doesn't need config file
     let output = Command::new("fusermount")
         .args(&["-u", &mount_point])
         .output();
@@ -196,7 +211,7 @@ async fn unmount_remote(remote_name: String) -> Result<CommandResult, String> {
             })
         }
         _ => {
-            // Try umount as fallback
+            // Try umount as fallback - this also doesn't need config file
             let output = Command::new("umount")
                 .arg(&mount_point)
                 .output()
@@ -217,10 +232,16 @@ async fn unmount_remote(remote_name: String) -> Result<CommandResult, String> {
 
 // Test connection to a remote
 #[tauri::command]
-async fn test_connection(remote_name: String) -> Result<CommandResult, String> {
-    let output = Command::new("rclone")
-        .args(&["lsf", &format!("{}:", remote_name)])
-        .output()
+async fn test_connection(remote_name: String, config_path_opt: Option<String>) -> Result<CommandResult, String> {
+    let mut cmd = Command::new("rclone");
+    cmd.arg("lsf").arg(&format!("{}:", remote_name));
+
+    if let Some(config_path_str) = config_path_opt {
+        let expanded_config_path = expand_tilde_path(&config_path_str)?;
+        cmd.arg("--config").arg(expanded_config_path);
+    }
+
+    let output = cmd.output()
         .map_err(|e| format!("Failed to execute rclone test: {}", e))?;
 
     if output.status.success() {
@@ -437,6 +458,19 @@ fn is_in_crontab(remote_name: &str) -> bool {
     }
 }
 
+// Helper function to expand tilde paths
+fn expand_tilde_path(path_str: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path_str);
+
+    if path.starts_with("~") {
+        let home_dir = std::env::var("HOME").map_err(|e| format!("HOME not set: {}", e))?;
+        let expanded_path = path_str.replacen("~", &home_dir, 1);
+        Ok(PathBuf::from(expanded_path))
+    } else {
+        Ok(PathBuf::from(path_str))
+    }
+}
+
 // Check if rclone is installed
 #[tauri::command]
 async fn is_rclone_installed() -> Result<bool, String> {
@@ -487,19 +521,19 @@ async fn get_available_plugins() -> Result<Vec<Plugin>, String> {
 
 // Add a new remote using a plugin
 #[tauri::command]
-async fn add_remote_with_plugin(plugin_name: String, config: std::collections::HashMap<String, String>) -> Result<CommandResult, String> {
+async fn add_remote_with_plugin(plugin_name: String, config: std::collections::HashMap<String, String>, config_path_opt: Option<String>) -> Result<CommandResult, String> {
     // Get the plugin configuration
     let plugins_dir = std::env::current_dir()
         .map_err(|e| format!("Failed to get current directory: {}", e))?
         .join("plugins")
         .join(&plugin_name);
 
-    let config_path = plugins_dir.join("config.json");
-    if !config_path.exists() {
+    let config_path_file = plugins_dir.join("config.json");
+    if !config_path_file.exists() {
         return Err(format!("Plugin {} not found", plugin_name));
     }
 
-    let config_content = std::fs::read_to_string(&config_path)
+    let config_content = std::fs::read_to_string(&config_path_file)
         .map_err(|e| format!("Failed to read plugin config: {}", e))?;
 
     let plugin: Plugin = serde_json::from_str(&config_content)
@@ -529,15 +563,20 @@ async fn add_remote_with_plugin(plugin_name: String, config: std::collections::H
         }
     }
 
-    // Get the rclone config path
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("rclone");
+    // Use the provided config path or default to ~/.config/rclone/rclone.conf
+    let config_path = if let Some(path_str) = config_path_opt {
+        expand_tilde_path(&path_str)?
+    } else {
+        // Use the default path
+        let home_dir = std::env::var("HOME").map_err(|e| format!("HOME not set: {}", e))?;
+        std::path::PathBuf::from(&home_dir).join(".config").join("rclone").join("rclone.conf")
+    };
 
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create config directory: {}", e))?;
-
-    let config_path = config_dir.join("rclone.conf");
+    // Create the parent directory if it doesn't exist
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {}", e))?;
+    }
 
     // Read the existing config
     let mut config_content = if config_path.exists() {
@@ -570,8 +609,24 @@ async fn add_remote_with_plugin(plugin_name: String, config: std::collections::H
     })
 }
 
+// Open file dialog using Tauri v2 dialog plugin
+#[tauri::command]
+async fn open_file_dialog(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    let file_path = app_handle.dialog().file()
+        .add_filter("Config Files", &["conf"])
+        .blocking_pick_file();
+
+    match file_path {
+        Some(path) => Ok(Some(path.to_string())),
+        None => Ok(None),
+    }
+}
+
+
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_remotes,
             mount_remote,
@@ -583,7 +638,8 @@ fn main() {
             is_remote_in_cron,
             is_rclone_installed,
             get_available_plugins,
-            add_remote_with_plugin
+            add_remote_with_plugin,
+            open_file_dialog
         ])
         .setup(|app| {
             // Set window title - add error handling

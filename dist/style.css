@@ -5,7 +5,7 @@
   height: calc(100vh - 20px);
   display: flex;
   flex-direction: column;
-  padding: 10px;
+  padding: 10px; /* Add back padding for proper spacing */
 }
 
 /* Header styling - structural CSS only */
@@ -15,7 +15,6 @@
   align-items: center;
   margin-bottom: 10px;
   padding-bottom: 5px;
-  border-bottom: 1px solid var(--border-dark);
 }
 
 .header-title {
@@ -45,6 +44,35 @@
   flex: 1;
   overflow: auto;
   margin-bottom: 5px;
+}
+
+/* Custom table styling to match CS16 aesthetic */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: var(--secondary-bg);
+  border: none; /* Remove table border */
+}
+
+th, td {
+  padding: 3px 5px; /* Much thinner padding */
+  text-align: left;
+  border: none; /* Remove all borders */
+}
+
+th {
+  background-color: var(--bg);
+  color: var(--text); /* White text instead of gold */
+  font-weight: normal; /* Normal weight, not bold */
+  border: none; /* Remove header borders */
+}
+
+td {
+  border: none; /* Remove cell borders */
+}
+
+tr.mounted {
+  background-color: var(--secondary-bg);
 }
 
 /* Button container styling - structural CSS only */

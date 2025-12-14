@@ -4,20 +4,22 @@
   "description": "SFTP remote type plugin",
   "version": "1.0.0",
   "author": "de_rclone",
-  "fields": [
+  "basic_fields": [
     {
       "name": "host",
       "display_name": "Host",
       "type": "text",
       "required": true,
-      "placeholder": "example.com"
+      "placeholder": "example.com",
+      "tooltip": "SSH host to connect to, e.g. example.com"
     },
     {
-      "name": "user", 
+      "name": "user",
       "display_name": "Username",
       "type": "text",
       "required": true,
-      "placeholder": "username"
+      "placeholder": "username",
+      "tooltip": "SSH username"
     },
     {
       "name": "port",
@@ -25,27 +27,90 @@
       "type": "number",
       "required": false,
       "default": "22",
-      "placeholder": "22"
+      "placeholder": "22",
+      "tooltip": "SSH port number, default is 22"
     },
     {
       "name": "pass",
       "display_name": "Password",
       "type": "password",
       "required": false,
-      "placeholder": "password"
+      "placeholder": "leave blank to use ssh-agent",
+      "tooltip": "SSH password, leave blank to use ssh-agent"
     },
     {
       "name": "key_file",
       "display_name": "Private Key File",
       "type": "file",
       "required": false,
-      "placeholder": "/path/to/private/key"
+      "placeholder": "/path/to/private/key",
+      "tooltip": "Path to PEM-encoded private key file"
+    }
+  ],
+  "advanced_fields": [
+    {
+      "name": "key_pem",
+      "display_name": "PEM Private Key",
+      "type": "text",
+      "required": false,
+      "placeholder": "Raw PEM-encoded private key",
+      "tooltip": "Raw PEM-encoded private key on a single line"
     },
     {
-      "name": "use_fips_cipher",
-      "display_name": "Use FIPS cipher",
+      "name": "key_file_pass",
+      "display_name": "Key File Passphrase",
+      "type": "password",
+      "required": false,
+      "placeholder": "Passphrase to decrypt private key",
+      "tooltip": "Passphrase to decrypt the PEM-encoded private key file"
+    },
+    {
+      "name": "pubkey",
+      "display_name": "Public Certificate",
+      "type": "text",
+      "required": false,
+      "placeholder": "SSH public certificate",
+      "tooltip": "SSH public certificate for public certificate based authentication"
+    },
+    {
+      "name": "pubkey_file",
+      "display_name": "Public Certificate File",
+      "type": "file",
+      "required": false,
+      "placeholder": "/path/to/pubcert",
+      "tooltip": "Path to public key file for certificate authentication"
+    },
+    {
+      "name": "key_use_agent",
+      "display_name": "Use SSH Agent",
       "type": "checkbox",
-      "required": false
+      "required": false,
+      "default": "false",
+      "tooltip": "Force usage of ssh-agent"
+    },
+    {
+      "name": "use_insecure_cipher",
+      "display_name": "Use Insecure Ciphers",
+      "type": "checkbox",
+      "required": false,
+      "default": "false",
+      "tooltip": "Enable insecure ciphers and key exchange methods"
+    },
+    {
+      "name": "disable_hashcheck",
+      "display_name": "Disable Hash Check",
+      "type": "checkbox",
+      "required": false,
+      "default": "false",
+      "tooltip": "Disable execution of SSH commands to determine remote file hashing"
+    },
+    {
+      "name": "ssh",
+      "display_name": "External SSH Binary",
+      "type": "text",
+      "required": false,
+      "placeholder": "Path and arguments to ssh binary",
+      "tooltip": "Path and arguments to external ssh binary"
     }
   ],
   "validation": {

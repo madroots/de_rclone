@@ -722,13 +722,14 @@ async function openSettings() {
             <button class="cs-btn" id="browse-config-btn" style="white-space: nowrap;">Browse...</button>
           </div>
         </div>
-        <fieldset class="cs-fieldset" style="margin: 10px 0;">
-          <legend class="cs-input__label">Theme:</legend>
+        <div style="margin: 10px 0;">
+          <label class="cs-input__label">Theme:</label>
           <div style="margin-top: 4px;">
-            <input type="radio" id="theme-cs16" name="theme" value="cs16" ${localStorage.getItem('theme') === 'cs16' ? 'checked' : ''}>
-            <label for="theme-cs16">CS 1.6 Steam</label>
+            <select id="theme-select" class="cs-select">
+              <option value="cs16" ${localStorage.getItem('theme') === 'cs16' ? 'selected' : ''}>CS 1.6 Steam</option>
+            </select>
           </div>
-        </fieldset>
+        </div>
         <div class="progress-content" style="justify-content: flex-end; padding-top: 15px;">
           <button class="cs-btn settings-modal-cancel-btn">Cancel</button>
           <button class="cs-btn settings-modal-ok-btn" style="margin-left: 5px;">OK</button>
@@ -743,10 +744,10 @@ async function openSettings() {
   modal.querySelector('.settings-modal-ok-btn').addEventListener('click', () => {
     const newPath = document.getElementById('config-path').value;
     localStorage.setItem('rcloneConfigPath', newPath);
-    // Save theme selection if needed
-    const selectedThemeElement = document.querySelector('input[name="theme"]:checked');
-    if (selectedThemeElement) {
-      const selectedTheme = selectedThemeElement.value;
+    // Save theme selection
+    const themeSelect = document.getElementById('theme-select');
+    if (themeSelect) {
+      const selectedTheme = themeSelect.value;
       localStorage.setItem('theme', selectedTheme);
     }
     modal.remove();
@@ -797,24 +798,34 @@ async function addRemote() {
     });
 
     const addRemoteHtml = `
-      <div style="padding: 20px; background: var(--bg); color: var(--text);">
-        <h3>Add New Remote</h3>
-        <div style="margin: 10px 0;">
-          <label>Remote Type:</label>
-          <select id="remote-type" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); padding: 5px; width: 100%;">
-            ${pluginOptions}
-          </select>
+      <div class="progress-modal-content">
+        <div class="progress-header">
+          <span class="progress-title">Add New Remote</span>
         </div>
-        <div style="margin: 10px 0;">
-          <label>Remote Name:</label>
-          <input type="text" id="remote-name" placeholder="Enter remote name" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;">
-        </div>
-        <div id="plugin-fields" style="margin: 10px 0;">
-          <!-- Plugin-specific fields will be loaded here -->
-        </div>
-        <div style="margin: 15px 0; text-align: right;">
-          <button class="cs-btn" id="submit-remote-btn">Add Remote</button>
-          <button class="cs-btn" id="cancel-remote-btn" style="margin-left: 5px;">Cancel</button>
+        <div class="progress-body">
+          <div style="margin: 10px 0;">
+            <label class="cs-input__label">Remote Type:</label>
+            <div style="margin-top: 4px;">
+              <select id="remote-type" class="cs-select" style="width: 100%;">
+                ${pluginOptions}
+              </select>
+            </div>
+          </div>
+          <div style="margin: 10px 0;">
+            <label class="cs-input__label">Remote Name:</label>
+            <div style="margin-top: 4px;">
+              <input type="text" id="remote-name" class="cs-input" placeholder="Enter remote name" style="width: 100%;">
+            </div>
+          </div>
+          <div style="margin: 10px 0; height: 300px; overflow-y: auto; border: 1px solid var(--border-dark); padding: 10px; max-height: 300px;">
+            <div id="plugin-fields">
+              <!-- Plugin-specific fields will be loaded here -->
+            </div>
+          </div>
+          <div class="progress-content" style="justify-content: flex-end; padding-top: 15px;">
+            <button class="cs-btn cancel-remote-btn">Cancel</button>
+            <button class="cs-btn submit-remote-btn" style="margin-left: 5px;">Add Remote</button>
+          </div>
         </div>
       </div>
     `;
@@ -822,16 +833,8 @@ async function addRemote() {
     // Create modal div
     const modal = document.createElement('div');
     modal.id = 'add-remote-modal';
+    modal.className = 'progress-modal'; // Use same class as other modals
     modal.innerHTML = addRemoteHtml;
-    modal.style.position = 'fixed';
-    modal.style.top = '50%';
-    modal.style.left = '50%';
-    modal.style.transform = 'translate(-50%, -50%)';
-    modal.style.backgroundColor = 'var(--bg)';
-    modal.style.border = '1px solid var(--border-light)';
-    modal.style.padding = '20px';
-    modal.style.zIndex = '1000';
-    modal.style.width = '500px';
 
     document.body.appendChild(modal);
 
@@ -842,47 +845,106 @@ async function addRemote() {
       const selectedPlugin = plugins.find(p => p.name === selectedPluginName);
 
       if (selectedPlugin) {
-        let fieldsHtml = '<div style="margin-top: 10px;"><h4>Configuration Fields:</h4>';
+        let fieldsHtml = '<div style="margin-top: 10px;"><h4 class="cs-input__label">Basic Configuration:</h4>';
 
-        selectedPlugin.fields.forEach(field => {
+        // Display basic fields
+        const basicFields = selectedPlugin.basic_fields || selectedPlugin.fields || [];
+        basicFields.forEach(field => {
           const defaultValue = field.default || '';
           const placeholder = field.placeholder || '';
 
           let fieldHtml = '';
           switch (field.field_type) {
             case 'password':
-              fieldHtml = `<input type="password" id="field-${field.name}" placeholder="${placeholder}" value="${defaultValue}" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;">`;
+              fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
               break;
             case 'checkbox':
               const checked = defaultValue === 'true' ? 'checked' : '';
               fieldHtml = `<input type="checkbox" id="field-${field.name}" ${checked} style="margin-right: 5px;">`;
               break;
             case 'file':
-              fieldHtml = `<input type="file" id="field-${field.name}" placeholder="${placeholder}" value="${defaultValue}" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;">`;
+              fieldHtml = `<input type="file" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
               break;
             case 'number':
-              fieldHtml = `<input type="number" id="field-${field.name}" placeholder="${placeholder}" value="${defaultValue}" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;">`;
+              fieldHtml = `<input type="number" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
               break;
             default: // text, etc.
-              fieldHtml = `<input type="text" id="field-${field.name}" placeholder="${placeholder}" value="${defaultValue}" style="background: var(--secondary-bg); color: var(--text); border: 1px solid var(--border-dark); width: 100%; padding: 5px;">`;
+              fieldHtml = `<input type="text" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
               break;
           }
 
           fieldsHtml += `
             <div style="margin: 8px 0;">
-              <label>${field.display_name}${field.required ? ' *' : ''}:</label>
+              <label class="cs-input__label">${field.display_name}${field.required ? ' *' : ''}:</label>
               ${fieldHtml}
             </div>
           `;
         });
 
+        // Add advanced fields toggle
+        if (selectedPlugin.advanced_fields && selectedPlugin.advanced_fields.length > 0) {
+          fieldsHtml += `<div style="margin: 15px 0;"><button id="toggle-advanced-fields" class="cs-btn">Show Advanced Options</button></div>`;
+
+          // Initially hide advanced fields
+          fieldsHtml += `<div id="advanced-fields-container" style="display: none; margin-top: 15px; padding-top: 10px; border-top: 1px solid var(--border-dark);">`;
+          fieldsHtml += `<h4 class="cs-input__label">Advanced Configuration:</h4>`;
+
+          selectedPlugin.advanced_fields.forEach(field => {
+            const defaultValue = field.default || '';
+            const placeholder = field.placeholder || '';
+
+            let fieldHtml = '';
+            switch (field.field_type) {
+              case 'password':
+                fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
+                break;
+              case 'checkbox':
+                const checked = defaultValue === 'true' ? 'checked' : '';
+                fieldHtml = `<input type="checkbox" id="field-${field.name}" ${checked} style="margin-right: 5px;">`;
+                break;
+              case 'file':
+                fieldHtml = `<input type="file" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
+                break;
+              case 'number':
+                fieldHtml = `<input type="number" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
+                break;
+              default: // text, etc.
+                fieldHtml = `<input type="text" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
+                break;
+            }
+
+            fieldsHtml += `
+              <div style="margin: 8px 0;">
+                <label class="cs-input__label">${field.display_name}${field.required ? ' *' : ''}:</label>
+                ${fieldHtml}
+              </div>
+            `;
+          });
+          fieldsHtml += `</div>`;
+        }
+
         fieldsHtml += '</div>';
         document.getElementById('plugin-fields').innerHTML = fieldsHtml;
+
+        // Add event listener for advanced fields toggle
+        const toggleButton = document.getElementById('toggle-advanced-fields');
+        if (toggleButton) {
+          toggleButton.addEventListener('click', function() {
+            const container = document.getElementById('advanced-fields-container');
+            if (container.style.display === 'none') {
+              container.style.display = 'block';
+              this.textContent = 'Hide Advanced Options';
+            } else {
+              container.style.display = 'none';
+              this.textContent = 'Show Advanced Options';
+            }
+          });
+        }
       }
     });
 
     // Add event listener for submit button
-    document.getElementById('submit-remote-btn').addEventListener('click', async function() {
+    document.querySelector('.submit-remote-btn').addEventListener('click', async function() {
       const remoteType = document.getElementById('remote-type').value;
       const remoteName = document.getElementById('remote-name').value.trim();
 
@@ -903,10 +965,11 @@ async function addRemote() {
       const config = { remote_name: remoteName };
 
       // Add values for each required field
-      plugin.fields.forEach(field => {
+      const allFields = [...(plugin.basic_fields || plugin.fields || []), ...(plugin.advanced_fields || [])];
+      allFields.forEach(field => {
         const element = document.getElementById(`field-${field.name}`);
         if (element) {
-          // Handle checkbox differently 
+          // Handle checkbox differently
           if (field.field_type === 'checkbox') {
             config[field.name] = element.checked ? 'true' : 'false';
           } else {
@@ -921,24 +984,55 @@ async function addRemote() {
         const result = await invoke('add_remote_with_plugin', {
           pluginName: remoteType,
           config: config,
-          configPathOpt: configPath
+          config_path_opt: configPath
         });
 
         if (result.success) {
-          showGeneralModal('Success', result.message);
-          document.getElementById('add-remote-modal').remove();
-          await loadRemotes(); // Refresh the list
+          // Show that remote was added and now testing connection
+          showStatus(`Added remote. Testing connection...`, 'info');
+
+          // Now test the connection to the newly added remote
+          const testResult = await invoke('test_connection', {
+            remoteName: remoteName,
+            config_path_opt: configPath
+          });
+
+          if (testResult.success) {
+            // Connection test successful
+            showGeneralModal('Success', `Remote added and connection tested successfully!\n${testResult.message}`);
+            document.getElementById('add-remote-modal').remove();
+            await loadRemotes(); // Refresh the list
+          } else {
+            // Connection test failed - offer options
+            const shouldSaveAnyway = confirm(
+              `Connection test failed: ${testResult.message}\n\n` +
+              `Do you want to keep the remote configuration anyway?\n\n` +
+              `Click OK to keep the remote configuration despite the connection failure.\n` +
+              `Click Cancel to stay and make changes to the configuration.`
+            );
+
+            if (shouldSaveAnyway) {
+              // User chose to keep the remote despite the connection failure
+              showGeneralModal('Remote Saved', `Remote added with connection test failure.\n${testResult.message}`);
+              document.getElementById('add-remote-modal').remove();
+              await loadRemotes(); // Refresh the list
+            } else {
+              // User wants to make more changes - keep the modal open
+              showStatus('Connection test failed. Please review your configuration.', 'warning');
+            }
+          }
         } else {
-          showGeneralModal('Failed', result.message);
+          showGeneralModal('Failed to add remote', result.message);
         }
       } catch (error) {
         console.error('Error adding remote:', error);
-        showGeneralModal('Error', `Failed to add remote: ${error.message}`);
+        console.error('Error object details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+        showGeneralModal('Error', `Failed to add remote: ${error.message || error}`);
       }
     });
 
     // Add event listener for cancel button
-    document.getElementById('cancel-remote-btn').addEventListener('click', () => {
+    document.querySelector('.cancel-remote-btn').addEventListener('click', () => {
       document.getElementById('add-remote-modal').remove();
     });
 

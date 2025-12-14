@@ -36,6 +36,8 @@ struct PluginField {
     default: String,
     #[serde(default)]
     placeholder: String,
+    #[serde(default)]
+    tooltip: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,7 +47,10 @@ struct Plugin {
     description: String,
     version: String,
     author: String,
-    fields: Vec<PluginField>,
+    #[serde(default)]
+    basic_fields: Vec<PluginField>,
+    #[serde(default)]
+    advanced_fields: Vec<PluginField>,
     #[serde(default)]
     validation: HashMap<String, serde_json::Value>,
 }
@@ -487,9 +492,37 @@ async fn is_rclone_installed() -> Result<bool, String> {
 // Get available plugins
 #[tauri::command]
 async fn get_available_plugins() -> Result<Vec<Plugin>, String> {
-    let plugins_dir = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?
-        .join("plugins");
+    // Try multiple locations for plugins to support both dev and prod modes
+    let mut plugins_dir = std::path::PathBuf::new();
+
+    // First, try relative to executable (for AppImage/prod)
+    if let Ok(exe_dir) = std::env::current_exe() {
+        if let Some(parent) = exe_dir.parent() {
+            let exe_plugins_dir = parent.join("plugins");
+            if exe_plugins_dir.exists() {
+                plugins_dir = exe_plugins_dir;
+            }
+        }
+    }
+
+    // If not found relative to executable, try relative to current dir (for dev)
+    if !plugins_dir.exists() {
+        let current_dir_plugins = std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?
+            .join("..")  // Go up to project root
+            .join("plugins");
+        if current_dir_plugins.exists() {
+            plugins_dir = current_dir_plugins;
+        } else {
+            // Try current directory directly
+            let current_plugins = std::env::current_dir()
+                .map_err(|e| format!("Failed to get current directory: {}", e))?
+                .join("plugins");
+            if current_plugins.exists() {
+                plugins_dir = current_plugins;
+            }
+        }
+    }
 
     if !plugins_dir.exists() {
         return Ok(Vec::new());
@@ -522,25 +555,58 @@ async fn get_available_plugins() -> Result<Vec<Plugin>, String> {
 // Add a new remote using a plugin
 #[tauri::command]
 async fn add_remote_with_plugin(plugin_name: String, config: std::collections::HashMap<String, String>, config_path_opt: Option<String>) -> Result<CommandResult, String> {
-    // Get the plugin configuration
-    let plugins_dir = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?
-        .join("plugins")
-        .join(&plugin_name);
+    // Find plugin configuration in multiple possible locations
+    let mut plugin_config_path = std::path::PathBuf::new();
+    let mut found = false;
 
-    let config_path_file = plugins_dir.join("config.json");
-    if !config_path_file.exists() {
+    // First, try relative to executable (for AppImage/prod)
+    if let Ok(exe_dir) = std::env::current_exe() {
+        if let Some(parent) = exe_dir.parent() {
+            let exe_plugin_path = parent.join("plugins").join(&plugin_name).join("config.json");
+            if exe_plugin_path.exists() {
+                plugin_config_path = exe_plugin_path;
+                found = true;
+            }
+        }
+    }
+
+    // If not found relative to executable, try relative to current dir (for dev)
+    if !found {
+        let current_dir_plugin = std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?
+            .join("..")  // Go up to project root
+            .join("plugins")
+            .join(&plugin_name)
+            .join("config.json");
+        if current_dir_plugin.exists() {
+            plugin_config_path = current_dir_plugin;
+            found = true;
+        } else {
+            // Try current directory directly
+            let current_plugin = std::env::current_dir()
+                .map_err(|e| format!("Failed to get current directory: {}", e))?
+                .join("plugins")
+                .join(&plugin_name)
+                .join("config.json");
+            if current_plugin.exists() {
+                plugin_config_path = current_plugin;
+                found = true;
+            }
+        }
+    }
+
+    if !found {
         return Err(format!("Plugin {} not found", plugin_name));
     }
 
-    let config_content = std::fs::read_to_string(&config_path_file)
+    let config_content = std::fs::read_to_string(&plugin_config_path)
         .map_err(|e| format!("Failed to read plugin config: {}", e))?;
 
     let plugin: Plugin = serde_json::from_str(&config_content)
         .map_err(|e| format!("Failed to parse plugin config: {}", e))?;
 
-    // Validate the provided configuration against the plugin schema
-    for field in &plugin.fields {
+    // Validate the provided configuration against the plugin schema - check basic fields
+    for field in &plugin.basic_fields {
         if field.required && !config.contains_key(&field.name) {
             return Err(format!("Required field '{}' is missing", field.name));
         }
@@ -560,6 +626,61 @@ async fn add_remote_with_plugin(plugin_name: String, config: std::collections::H
                 },
                 _ => {} // Other types don't need specific validation here
             }
+        }
+    }
+
+    // Validate advanced fields as well
+    for field in &plugin.advanced_fields {
+        if field.required && !config.contains_key(&field.name) {
+            return Err(format!("Required field '{}' is missing", field.name));
+        }
+
+        if let Some(value) = config.get(&field.name) {
+            // Basic validation based on field type
+            match field.field_type.as_str() {
+                "number" => {
+                    if value.parse::<f64>().is_err() {
+                        return Err(format!("Field '{}' must be a number", field.name));
+                    }
+                },
+                "checkbox" => {
+                    if value != "true" && value != "false" {
+                        return Err(format!("Field '{}' must be true or false", field.name));
+                    }
+                },
+                _ => {} // Other types don't need specific validation here
+            }
+        }
+    }
+
+    // Prepare the configuration for saving - obscure passwords where needed
+    let mut processed_config = std::collections::HashMap::new();
+    for (key, value) in config {
+        if key == "pass" { // For now, just obscure the password field - this could be extended for other sensitive fields
+            if !value.is_empty() {
+                // Call rclone obscure to encrypt the password
+                let output = std::process::Command::new("rclone")
+                    .arg("obscure")
+                    .arg(&value)
+                    .output()
+                    .map_err(|e| format!("Failed to run rclone obscure: {}", e))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("Failed to obscure password: {}", stderr));
+                }
+
+                let obscured_password = String::from_utf8(output.stdout)
+                    .map_err(|e| format!("Invalid UTF-8 in rclone output: {}", e))?
+                    .trim()
+                    .to_string();
+
+                processed_config.insert(key, obscured_password);
+            } else {
+                processed_config.insert(key, value); // Keep empty passwords as-is
+            }
+        } else {
+            processed_config.insert(key, value);
         }
     }
 
@@ -587,12 +708,19 @@ async fn add_remote_with_plugin(plugin_name: String, config: std::collections::H
     };
 
     // Generate the new remote configuration
-    let remote_name = config.get("remote_name").ok_or("remote_name is required")?;
+    let remote_name = processed_config.get("remote_name").ok_or("remote_name is required")?;
     let mut remote_config = format!("\n[{}]\ntype = {}\n", remote_name, plugin_name);
 
-    for (key, value) in &config {
+    for (key, value) in &processed_config {
         if key != "remote_name" {  // Skip the remote name field as it's used for the section name
-            remote_config.push_str(&format!("{} = {}\n", key, value));
+            // For checkbox fields in rclone config, we need to handle boolean values specially
+            if value == "true" {
+                remote_config.push_str(&format!("{} = true\n", key));
+            } else if value == "false" {
+                remote_config.push_str(&format!("{} = false\n", key));
+            } else {
+                remote_config.push_str(&format!("{} = {}\n", key, value));
+            }
         }
     }
 

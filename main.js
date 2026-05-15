@@ -52,7 +52,9 @@ function getRcloneConfigPath(customPath) {
 }
 
 function getMountDir(remoteName) {
-    return path.join(os.homedir(), 'mnt', remoteName);
+    const uid = os.userInfo().uid;
+    const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+    return path.join(runtimeDir, 'rclone-mounts', remoteName);
 }
 
 // --- IPC Handlers ---
@@ -348,8 +350,9 @@ ipcMain.handle('get_available_plugins', async () => {
 
 function getMountCmdString(remoteName, mountPoint, configPath) {
     // Construct the exact command line used for cron
-    // We use full path for safety if possible, but 'rclone' is standard
-    let cmd = `rclone mount ${remoteName}: "${mountPoint}" --vfs-cache-mode writes --daemon`;
+    // We add a retry loop for mkdir because on headless boots without loginctl enable-linger,
+    // the XDG_RUNTIME_DIR might not be created immediately by systemd.
+    let cmd = `for i in $(seq 1 30); do mkdir -p "${mountPoint}" 2>/dev/null && break; sleep 2; done; rclone mount ${remoteName}: "${mountPoint}" --vfs-cache-mode writes --daemon`;
     if (configPath) {
         cmd += ` --config "${configPath}"`;
     }
@@ -551,4 +554,86 @@ ipcMain.handle('get_remote_config', async (event, { remoteName, configPathOpt })
         }
     }
     return result;
+});
+
+// --- Legacy Mount and Cron Handlers ---
+ipcMain.handle('check_legacy_state', async () => {
+    const legacyDir = path.join(os.homedir(), 'mnt');
+    const mounts = [];
+    if (fs.existsSync(legacyDir)) {
+        try {
+            const dirs = fs.readdirSync(legacyDir);
+            for (const dir of dirs) {
+                const fullPath = path.join(legacyDir, dir);
+                if (fs.statSync(fullPath).isDirectory()) {
+                    if (await isMounted(fullPath)) {
+                        mounts.push(fullPath);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Error checking legacy mounts:', e);
+        }
+    }
+
+    let legacyCrons = [];
+    try {
+        const list = await execPromise('crontab -l').catch(() => ({ stdout: '' }));
+        if (list.stdout) {
+            legacyCrons = list.stdout.split('\n').filter(line => 
+                line.includes('rclone mount') && 
+                line.includes('/mnt/') && 
+                line.includes('# Added by de_rclone')
+            );
+        }
+    } catch (e) {}
+
+    return { mounts, legacyCrons };
+});
+
+ipcMain.handle('remove_legacy_crons', async () => {
+    try {
+        const list = await execPromise('crontab -l').catch(() => ({ stdout: '' }));
+        if (!list.stdout) return { success: true, count: 0 };
+
+        const lines = list.stdout.split('\n');
+        const newLines = lines.filter(line => {
+            const isLegacy = line.includes('rclone mount') && line.includes('/mnt/') && line.includes('# Added by de_rclone');
+            return !isLegacy && line.trim() !== '';
+        });
+
+        if (lines.length === newLines.length) {
+             return { success: true, count: 0 };
+        }
+
+        const tempFile = path.join(os.tmpdir(), `cron_${Date.now()}`);
+        const newContent = newLines.join('\n') + (newLines.length > 0 ? '\n' : '');
+        fs.writeFileSync(tempFile, newContent);
+        await execPromise(`crontab "${tempFile}"`);
+        fs.unlinkSync(tempFile);
+
+        return { success: true, count: lines.length - newLines.length };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('unmount_legacy_mounts', async (event, paths) => {
+    let successCount = 0;
+    for (const mountPoint of paths) {
+        try {
+            await execPromise(`fusermount -u "${mountPoint}"`);
+            try { if (fs.existsSync(mountPoint)) fs.rmdirSync(mountPoint); } catch (e) { }
+            successCount++;
+        } catch (e) {
+            try {
+                await execPromise(`umount "${mountPoint}"`);
+                try { if (fs.existsSync(mountPoint)) fs.rmdirSync(mountPoint); } catch (e) { }
+                successCount++;
+            } catch (e2) {
+                console.error(`Legacy unmount failed for ${mountPoint}: ${e2.message}`);
+            }
+        }
+    }
+    return { success: successCount === paths.length, count: successCount };
 });

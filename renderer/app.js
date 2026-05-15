@@ -61,7 +61,104 @@ document.addEventListener('DOMContentLoaded', () => {
     console.error('Failed to load remotes:', error);
     showStatus(`Failed to load remotes: ${error.message}`, 'error');
   });
+
+  // Check for legacy mounts and crons after a short delay
+  setTimeout(checkLegacyState, 1000);
 });
+
+async function checkLegacyState() {
+  if (!window.api || !window.api.invoke) return; // Wait for initialization
+  try {
+    const state = await invoke('check_legacy_state');
+    const hasMounts = state.mounts && state.mounts.length > 0;
+    const hasCrons = state.legacyCrons && state.legacyCrons.length > 0;
+    
+    if (hasMounts || hasCrons) {
+      showLegacyStateWarning(state.mounts || [], state.legacyCrons || []);
+    }
+  } catch (e) {
+    console.error("Failed to check legacy state:", e);
+  }
+}
+
+function showLegacyStateWarning(mounts, crons) {
+  const modal = document.createElement('div');
+  modal.className = 'progress-modal';
+  
+  let detailsHtml = '';
+  if (mounts.length > 0) {
+    detailsHtml += `
+      <strong>Active Mounts (~/mnt):</strong>
+      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 80px; overflow-y: auto;">
+        ${mounts.map(m => `<li>${m}</li>`).join('')}
+      </ul>
+    `;
+  }
+  if (crons.length > 0) {
+    detailsHtml += `
+      <strong>Legacy Auto-mounts (Cron):</strong>
+      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 80px; overflow-y: auto;">
+        <li>Found ${crons.length} legacy cron entry(s).</li>
+      </ul>
+    `;
+  }
+
+  modal.innerHTML = `
+    <div class="progress-modal-content">
+      <div class="progress-header">
+        <span class="progress-title">Legacy Setup Detected</span>
+      </div>
+      <div class="progress-body" style="padding: 15px;">
+        <div class="progress-message" style="margin-bottom: 15px;">
+          The mount location has been updated to $XDG_RUNTIME_DIR.<br/><br/>
+          We detected parts of the old setup that should be cleaned up:
+          <div style="margin-top: 10px; font-size: 0.9em; text-align: left;">
+            ${detailsHtml}
+          </div>
+          <br/>
+          Would you like to clean them up now?
+        </div>
+        <div class="progress-content" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
+          <button class="cs-btn" id="legacy-cleanup-btn">Clean Up All</button>
+          <button class="cs-btn" id="legacy-ignore-btn">Ignore</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  document.getElementById('legacy-cleanup-btn').addEventListener('click', async () => {
+    const cleanupBtn = document.getElementById('legacy-cleanup-btn');
+    cleanupBtn.disabled = true;
+    cleanupBtn.textContent = "Cleaning...";
+    let success = true;
+
+    try {
+      if (mounts.length > 0) {
+        const mountResult = await invoke('unmount_legacy_mounts', mounts);
+        if (!mountResult.success) success = false;
+      }
+      if (crons.length > 0) {
+        const cronResult = await invoke('remove_legacy_crons');
+        if (!cronResult.success) success = false;
+      }
+
+      if (success) {
+        showStatus("Successfully cleaned up legacy setup.", "success");
+      } else {
+        showStatus("Some legacy components failed to clean up.", "warning");
+      }
+    } catch (e) {
+      showStatus("Failed during legacy cleanup: " + e.message, "error");
+    }
+    modal.remove();
+  });
+
+  document.getElementById('legacy-ignore-btn').addEventListener('click', () => {
+    modal.remove();
+  });
+}
 
 // Initialize Tauri API functions properly for v2
 function initializeTauriAPI() {

@@ -22,7 +22,7 @@ A robust, retro-styled GUI manager for **Rclone**, styled with the nostalgic CS 
   Supports various Rclone providers (S3, SFTP, Webdav etc.) via a flexible plugin system. Plugin collection is growing.
 
 - **Mount remote on startup**  
-  Easily enable or disable auto-mount on startup (Cron integration) directly from the context menu.
+  Easily enable or disable auto-mount on startup (Cron integration) directly from the context menu. *(Note: For true headless auto-mounts on systems without an active desktop session, you must enable lingering for your user with `loginctl enable-linger`)*
 
 - **Retro Aesthetics**  
   Nostalgic, fully themed UI based on the classic Counter-Strike 1.6 look.

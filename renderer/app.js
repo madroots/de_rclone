@@ -1180,7 +1180,11 @@ async function addRemote() {
           if (field.type === 'checkbox') {
             config[field.name] = element.checked ? 'true' : 'false';
           } else {
-            config[field.name] = element.value || field.default;
+            // Skip unset fields (no input, no default) — never write 'undefined'
+            const value = element.value || field.default;
+            if (value !== undefined && value !== '') {
+              config[field.name] = value;
+            }
           }
         }
       });

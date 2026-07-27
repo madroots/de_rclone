@@ -246,6 +246,21 @@ async function loadRemotes() {
     const remotes = await invoke('get_remotes', { configPathOpt: configPathFinal });
 
     await renderRemotesTable(remotes);
+
+    // Restore selection: rows were re-created and the previously selected
+    // remote object is now stale (e.g. mounted state changed after mount/unmount),
+    // which left Open Folder disabled until the user re-clicked the row.
+    if (selectedRemote) {
+      const fresh = remotes.find(r => r.name === selectedRemote.name);
+      selectedRemote = fresh || null;
+      updateButtonStates(selectedRemote);
+      if (fresh) {
+        const row = [...document.querySelectorAll('#remote-table-body tr')]
+          .find(tr => tr.children[1]?.textContent === fresh.name);
+        if (row) row.style.backgroundColor = 'var(--secondary-accent)';
+      }
+    }
+
     const message = `Loaded ${remotes.length} remotes`;
     defaultStatusMessage = message; // Update the default message
     showStatus(message, 'success', false); // Don't auto-reset the loaded message

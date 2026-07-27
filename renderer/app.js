@@ -1061,7 +1061,7 @@ async function addRemote() {
           const placeholder = field.placeholder || '';
 
           let fieldHtml = '';
-          switch (field.field_type) {
+          switch (field.type) {
             case 'password':
               fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
               break;
@@ -1101,7 +1101,7 @@ async function addRemote() {
             const placeholder = field.placeholder || '';
 
             let fieldHtml = '';
-            switch (field.field_type) {
+            switch (field.type) {
               case 'password':
                 fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="${defaultValue}" style="width: 100%;">`;
                 break;
@@ -1177,7 +1177,7 @@ async function addRemote() {
         const element = document.getElementById(`field-${field.name}`);
         if (element) {
           // Handle checkbox differently
-          if (field.field_type === 'checkbox') {
+          if (field.type === 'checkbox') {
             config[field.name] = element.checked ? 'true' : 'false';
           } else {
             config[field.name] = element.value || field.default;
@@ -1191,7 +1191,7 @@ async function addRemote() {
         const result = await invoke('add_remote_with_plugin', {
           pluginName: remoteType,
           config: config,
-          config_path_opt: configPath
+          configPathOpt: configPath
         });
 
         if (result.success) {
@@ -1201,7 +1201,7 @@ async function addRemote() {
           // Now test the connection to the newly added remote
           const testResult = await invoke('test_connection', {
             remoteName: remoteName,
-            config_path_opt: configPath
+            configPathOpt: configPath
           });
 
           if (testResult.success) {
@@ -1546,13 +1546,13 @@ async function openEditRemoteForm(remote, plugin, remoteConfig) {
       const element = document.getElementById(`field-${field.name}`);
       if (element) {
         // Handle checkboxes differently
-        if (field.field_type === 'checkbox') {
+        if (field.type === 'checkbox') {
           config[field.name] = element.checked ? 'true' : 'false';
         } else {
           // For other fields, use the current value
           const value = element.value;
           // For password fields, if it's empty, don't update it (keep existing encrypted value)
-          if (field.field_type === 'password' && value === '') {
+          if (field.type === 'password' && value === '') {
             // Don't update password if field is empty - keep existing encrypted value
             if (remoteConfig[field.name]) {
               config[field.name] = remoteConfig[field.name];
@@ -1612,7 +1612,7 @@ function loadPluginFieldsForEdit(plugin, remoteConfig) {
     const placeholder = field.placeholder || '';
 
     let fieldHtml = '';
-    switch (field.field_type) {
+    switch (field.type) {
       case 'password':
         // For password fields, don't show the current value for security - just show a placeholder
         fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="" style="width: 100%;">`;
@@ -1653,7 +1653,7 @@ function loadPluginFieldsForEdit(plugin, remoteConfig) {
       const placeholder = field.placeholder || '';
 
       let fieldHtml = '';
-      switch (field.field_type) {
+      switch (field.type) {
         case 'password':
           // For password fields, don't show the current value for security
           fieldHtml = `<input type="password" id="field-${field.name}" class="cs-input" placeholder="${placeholder}" value="" style="width: 100%;">`;
@@ -1712,7 +1712,7 @@ async function handleDeleteRemote(remote) {
       // Call the backend to delete the remote
       const result = await invoke('delete_remote', {
         remoteName: remote.name,
-        config_path_opt: configPath
+        configPathOpt: configPath
       });
 
       if (result.success) {

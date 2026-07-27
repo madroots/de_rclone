@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { exec, spawn } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 const os = require('os');
 
 let mainWindow;
@@ -94,10 +94,11 @@ ipcMain.handle('get_remotes', async (event, { configPathOpt }) => {
                 }
                 currentSection = trimmed.slice(1, -1);
                 currentType = null;
-            } else if (trimmed.startsWith('type')) {
-                const parts = trimmed.split('=');
-                if (parts.length > 1) {
-                    currentType = parts[1].trim();
+            } else {
+                // Exact key match: only `type = ...` sets the remote type
+                const eq = trimmed.indexOf('=');
+                if (eq > 0 && trimmed.slice(0, eq).trim() === 'type') {
+                    currentType = trimmed.slice(eq + 1).trim();
                 }
             }
         }
@@ -141,6 +142,19 @@ ipcMain.handle('get_remotes', async (event, { configPathOpt }) => {
         throw new Error(`Failed to read config: ${e.message}`);
     }
 });
+
+// Helper for execFile (no shell — args passed verbatim) to promise
+function execFilePromise(file, args) {
+    return new Promise((resolve, reject) => {
+        execFile(file, args, (error, stdout, stderr) => {
+            if (error) {
+                reject({ error, stderr });
+                return;
+            }
+            resolve({ stdout, stderr });
+        });
+    });
+}
 
 // Helper for exec to promise
 function execPromise(command) {
@@ -191,32 +205,51 @@ ipcMain.handle('mount_remote', async (event, { remoteName, configPathOpt }) => {
         args.push('--config', configPath);
     }
 
-    return new Promise((resolve, reject) => {
-        // Using spawn specifically for rclone to detach? 
-        // Actually, normal exec with --daemon should work, but spawn is safer for long running
-        // However, --daemon flag makes rclone fork itself.
+    return new Promise((resolve) => {
+        // --daemon makes rclone fork itself; parent exits 0 once the mount is ready,
+        // non-zero on failure. We pipe stderr so real errors reach the user.
+        const child = spawn('rclone', args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
 
-        const child = spawn('rclone', args, { stdio: 'ignore', detached: true });
+        let stderrBuf = '';
+        child.stderr.on('data', (d) => {
+            stderrBuf += d.toString();
+            if (stderrBuf.length > 65536) stderrBuf = stderrBuf.slice(-65536);
+        });
+
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            clearInterval(poll);
+            child.stderr.destroy(); // release pipe; daemon may hold it open
+            resolve(result);
+        };
 
         child.on('error', (err) => {
-            return resolve({ success: false, message: `Failed to start rclone: ${err.message}` });
+            finish({ success: false, message: `Failed to start rclone: ${err.message}` });
+        });
+
+        child.on('exit', (code) => {
+            if (code !== 0 && code !== null) {
+                const detail = stderrBuf.trim();
+                finish({ success: false, message: `rclone mount failed: ${detail || `exit code ${code}`}` });
+            }
+            // exit code 0: daemon reported ready; the poll below confirms the mountpoint
         });
 
         child.unref();
 
-        // We wait a bit to see if it mounts? Or just assume success if it triggered?
-        // rclone --daemon returns quickly.
-
-        setTimeout(async () => {
+        // Poll for the mountpoint: slow remotes (sftp handshake, webdav token
+        // refresh) can take several seconds to become ready.
+        const deadline = Date.now() + 8000;
+        const poll = setInterval(async () => {
             if (await isMounted(mountPoint)) {
-                resolve({ success: true, message: `Successfully mounted ${remoteName} at ${mountPoint}` });
-            } else {
-                // Check if it's just slow or failed silently.
-                // Ideally capture output before detaching, but --daemon suppresses it usually.
-                // Let's rely on mountpoint check.
-                resolve({ success: false, message: `Mount command executed but mountpoint not detected yet. Check logs.` });
+                finish({ success: true, message: `Successfully mounted ${remoteName} at ${mountPoint}` });
+            } else if (Date.now() > deadline) {
+                const detail = stderrBuf.trim();
+                finish({ success: false, message: `Mount not detected within 8s.${detail ? ` rclone: ${detail}` : ''}` });
             }
-        }, 1000);
+        }, 250);
     });
 });
 
@@ -352,7 +385,7 @@ function getMountCmdString(remoteName, mountPoint, configPath) {
     // Construct the exact command line used for cron
     // We add a retry loop for mkdir because on headless boots without loginctl enable-linger,
     // the XDG_RUNTIME_DIR might not be created immediately by systemd.
-    let cmd = `for i in $(seq 1 30); do mkdir -p "${mountPoint}" 2>/dev/null && break; sleep 2; done; rclone mount ${remoteName}: "${mountPoint}" --vfs-cache-mode writes --daemon`;
+    let cmd = `for i in $(seq 1 30); do mkdir -p "${mountPoint}" 2>/dev/null && break; sleep 2; done; rclone mount "${remoteName}:" "${mountPoint}" --vfs-cache-mode writes --daemon`;
     if (configPath) {
         cmd += ` --config "${configPath}"`;
     }
@@ -455,10 +488,11 @@ ipcMain.handle('add_remote_with_plugin', async (event, { pluginName, config, con
     const processedConfig = { ...config };
     if (processedConfig.pass) {
         try {
-            const { stdout } = await execPromise(`rclone obscure "${processedConfig.pass}"`);
+            // execFile: no shell, so passwords with $, `, ", \ etc. reach rclone verbatim
+            const { stdout } = await execFilePromise('rclone', ['obscure', processedConfig.pass]);
             processedConfig.pass = stdout.trim();
         } catch (e) {
-            throw new Error(`Failed to obscure password: ${e.message}`);
+            throw new Error(`Failed to obscure password: ${e.stderr || e.error?.message || e.message}`);
         }
     }
 
@@ -474,11 +508,28 @@ ipcMain.handle('add_remote_with_plugin', async (event, { pluginName, config, con
 
     const remoteName = processedConfig.remote_name;
     if (!remoteName) throw new Error("remote_name is required");
+    // Whitelist: prevents INI corruption ([, ], newlines) and broken shell commands
+    if (!/^[A-Za-z0-9_.\-]+$/.test(remoteName)) {
+        throw new Error("remote_name may only contain letters, digits, '_', '-', '.'");
+    }
+
+    // Reject duplicates: appending a second [name] section silently corrupts
+    // the remote definition (keys merge/override depending on parser).
+    const existingSections = currentConfigContent.split('\n')
+        .map(l => l.trim())
+        .filter(l => l.startsWith('[') && l.endsWith(']'))
+        .map(l => l.slice(1, -1));
+    if (existingSections.includes(remoteName)) {
+        throw new Error(`Remote '${remoteName}' already exists in the config`);
+    }
 
     let newBlock = `\n[${remoteName}]\ntype = ${pluginName}\n`;
     for (const key in processedConfig) {
         if (key === 'remote_name') continue;
-        newBlock += `${key} = ${processedConfig[key]}\n`;
+        const value = processedConfig[key];
+        // Skip empty optional fields instead of writing bare `key = ` lines
+        if (value === undefined || value === null || String(value).trim() === '') continue;
+        newBlock += `${key} = ${value}\n`;
     }
 
     fs.writeFileSync(configPath, currentConfigContent + newBlock);

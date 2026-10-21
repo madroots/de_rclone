@@ -61,6 +61,7 @@
       "name": "key_file_pass",
       "display_name": "Key File Passphrase",
       "type": "password",
+      "obscure": true,
       "required": false,
       "placeholder": "Passphrase to decrypt private key",
       "tooltip": "Passphrase to decrypt the PEM-encoded private key file"

@@ -58,11 +58,12 @@
       "tooltip": "Use explicit TLS (FTPS)"
     },
     {
-      "name": "concurreny",
+      "name": "concurrency",
       "display_name": "Concurrency",
       "type": "number",
       "required": false,
       "default": "2",
+      "legacy_names": ["concurreny"],
       "tooltip": "Maximum number of concurrent connections"
     },
     {

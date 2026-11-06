@@ -51,7 +51,24 @@ function getRcloneConfigPath(customPath) {
     return path.join(os.homedir(), '.config', 'rclone', 'rclone.conf');
 }
 
+function writeRcloneConfig(configPath, content) {
+    // Open without truncating so existing secrets become private before writing.
+    const fd = fs.openSync(configPath, 'a', 0o600);
+    try {
+        fs.fchmodSync(fd, 0o600);
+        fs.ftruncateSync(fd, 0);
+        fs.writeFileSync(fd, content, 'utf8');
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 function getMountDir(remoteName) {
+    // Existing rclone names may contain spaces; only forbid unsafe path components.
+    if (typeof remoteName !== 'string' || !remoteName ||
+        /[/\\\0\r\n]/.test(remoteName) || remoteName === '.' || remoteName === '..') {
+        throw new Error('Remote name cannot be used as a managed mount path');
+    }
     const uid = os.userInfo().uid;
     const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
     return path.join(runtimeDir, 'rclone-mounts', remoteName);
@@ -117,24 +134,10 @@ ipcMain.handle('get_remotes', async (event, { configPathOpt }) => {
         }
 
         // Populate cron status
-        try {
-            const { stdout } = await execFilePromise('crontab', ['-l']);
-            remotes.forEach(r => {
-                // Relaxed check: rclone mount ... remoteName: ...
-                // We check if the line contains "rclone mount" and "remoteName:"
-                // This covers manual entries with different flags or quoting
-                const lines = stdout.split('\n');
-                const isCron = lines.some(line => {
-                    return line.includes('rclone mount') && line.includes(`${r.name}:`);
-                });
-
-                if (isCron) {
-                    r.cron = "Yes";
-                }
-            });
-        } catch (e) {
-            // Crontab might be empty or fail
-        }
+        const cron = await readCrontab(true);
+        remotes.forEach(remote => {
+            if (isCronEntryFor(cron, remote.name)) remote.cron = "Yes";
+        });
 
         return remotes;
 
@@ -164,17 +167,26 @@ function shellQuote(value) {
 function validateRemoteName(name) {
     if (!name) throw new Error("remote_name is required");
     // Whitelist: prevents INI corruption ([, ], newlines) and broken shell commands
-    if (!/^[A-Za-z0-9_.\-]+$/.test(name)) {
+    if (!/^[A-Za-z0-9_.\-]+$/.test(name) || name === '.' || name === '..') {
         throw new Error("remote_name may only contain letters, digits, '_', '-', '.'");
     }
 }
 
-function isMounted(mountPoint) {
-    return new Promise(resolve => {
-        execFile('mountpoint', ['-q', mountPoint], (err) => {
-            resolve(!err); // exit 0 means it is a mountpoint
-        });
-    });
+async function isMounted(mountPoint) {
+    try {
+        fs.lstatSync(mountPoint);
+    } catch (e) {
+        if (e.code === 'ENOENT') return false;
+        throw new Error(`Unable to inspect mount point '${mountPoint}': ${e.message}`);
+    }
+    try {
+        await execFilePromise('mountpoint', ['-q', mountPoint]);
+        return true;
+    } catch (e) {
+        // util-linux reserves 32 for an existing path that is not a mountpoint.
+        if (e.error?.code === 32) return false;
+        throw new Error(`Unable to check mount point '${mountPoint}': ${e.stderr || e.error?.message || e.message}`);
+    }
 }
 
 ipcMain.handle('mount_remote', async (event, { remoteName, configPathOpt }) => {
@@ -242,42 +254,51 @@ ipcMain.handle('mount_remote', async (event, { remoteName, configPathOpt }) => {
         // refresh) can take several seconds to become ready.
         const deadline = Date.now() + 8000;
         const poll = setInterval(async () => {
-            if (await isMounted(mountPoint)) {
-                finish({ success: true, message: `Successfully mounted ${remoteName} at ${mountPoint}` });
-            } else if (Date.now() > deadline) {
-                const detail = stderrBuf.trim();
-                finish({ success: false, message: `Mount not detected within 8s.${detail ? ` rclone: ${detail}` : ''}` });
+            try {
+                if (await isMounted(mountPoint)) {
+                    finish({ success: true, message: `Successfully mounted ${remoteName} at ${mountPoint}` });
+                } else if (Date.now() > deadline) {
+                    const detail = stderrBuf.trim();
+                    finish({ success: false, message: `Mount not detected within 8s.${detail ? ` rclone: ${detail}` : ''}` });
+                }
+            } catch (e) {
+                finish({ success: false, message: e.message });
             }
         }, 250);
     });
 });
 
-ipcMain.handle('unmount_remote', async (event, { remoteName }) => {
+async function unmountRemote(remoteName) {
     const mountPoint = getMountDir(remoteName);
-
-    if (!(await isMounted(mountPoint))) {
-        // Try cleanup if directory exists but not mounted (stale state)
-        if (fs.existsSync(mountPoint)) {
-            try { fs.rmdirSync(mountPoint); } catch (e) { }
-        }
-        return { success: false, message: `${remoteName} is not mounted.` };
-    }
-
-    try {
-        await execFilePromise('fusermount', ['-u', mountPoint]);
-        // Clean up point
-        try { if (fs.existsSync(mountPoint)) fs.rmdirSync(mountPoint); } catch (e) { }
-        return { success: true, message: `Successfully unmounted ${remoteName}` };
-    } catch (e) {
-        // Fallback to umount
+    const mounted = await isMounted(mountPoint);
+    if (mounted) {
         try {
-            await execFilePromise('umount', [mountPoint]);
-            // Clean up point
-            try { if (fs.existsSync(mountPoint)) fs.rmdirSync(mountPoint); } catch (e2) { }
-            return { success: true, message: `Successfully unmounted ${remoteName}` };
-        } catch (e2) {
-            return { success: false, message: `Unmount failed: ${e.stderr || e.error?.message || e2.stderr || 'unknown error'}` };
+            await execFilePromise('fusermount', ['-u', mountPoint]);
+        } catch (firstError) {
+            try {
+                await execFilePromise('umount', [mountPoint]);
+            } catch (e) {
+                throw new Error(`Unmount '${remoteName}' failed: ${e.stderr || e.error?.message || e.message}; fusermount: ${firstError.stderr || firstError.error?.message || firstError.message}`);
+            }
         }
+        if (await isMounted(mountPoint)) {
+            throw new Error(`Unmount '${remoteName}' did not release ${mountPoint}; close files using the mount and retry`);
+        }
+    }
+    try {
+        if (fs.existsSync(mountPoint)) fs.rmdirSync(mountPoint);
+    } catch (e) {
+        throw new Error(`Could not remove managed mount directory '${mountPoint}': ${e.message}; check its contents and permissions, then retry`);
+    }
+    return mounted;
+}
+
+ipcMain.handle('unmount_remote', async (event, { remoteName }) => {
+    try {
+        const mounted = await unmountRemote(remoteName);
+        return { success: mounted, message: mounted ? `Successfully unmounted ${remoteName}` : `${remoteName} is not mounted.` };
+    } catch (e) {
+        return { success: false, message: e.message };
     }
 });
 
@@ -390,11 +411,81 @@ function getMountCmdString(remoteName, mountPoint, configPath) {
     return cmd;
 }
 
-function isCronEntryFor(content, remoteName) {
-    return String(content || '').split('\n').some(line =>
-        line.includes('rclone mount') && line.includes(`${remoteName}:`)
+function isCronLineFor(line, remoteName) {
+    if (/^\s*#/.test(line)) return false;
+    line = line.replace(/^\s*(?:@\S+\s+|(?:\S+\s+){5})/, '');
+    // Read shell words without executing them, including quoted names with spaces.
+    // Comments and command separators cannot supply a remote argument.
+    const words = [];
+    let word = '';
+    let quote = '';
+    let started = false;
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (quote) {
+            if (char === quote) quote = '';
+            else if (char === '\\' && quote === '"' && /[$`"\\]/.test(line[i + 1] || '')) word += line[++i];
+            else word += char;
+        } else if (char === '#' && !started) {
+            break;
+        } else if (char === "'" || char === '"') {
+            quote = char;
+            started = true;
+        } else if (char === '\\' && i + 1 < line.length) {
+            word += line[++i];
+            started = true;
+        } else if (/\s|[;|&()<>]/.test(char)) {
+            if (started) words.push(word);
+            if (!/\s/.test(char)) words.push(char);
+            word = '';
+            started = false;
+        } else {
+            word += char;
+            started = true;
+        }
+    }
+    if (started) words.push(word);
+    if (quote) return false;
+    return words.some((word, index) =>
+        path.basename(word) === 'rclone' &&
+        (index === 0 || [';', '|', '&', 'do', 'then', 'exec'].includes(words[index - 1])) &&
+        words[index + 1] === 'mount' && words[index + 2] === `${remoteName}:`
     );
 }
+
+function isCronEntryFor(content, remoteName) {
+    return String(content || '').split('\n').some(line => isCronLineFor(line, remoteName));
+}
+
+async function readCrontab(allowMissing = false) {
+    try {
+        const { stdout } = await execFilePromise('crontab', ['-l'], { env: { ...process.env, LC_ALL: 'C' } });
+        return stdout || '';
+    } catch (e) {
+        if (e.error?.code === 1 && /^no crontab for [^\r\n]+\s*$/i.test((e.stderr || '').trim())) return '';
+        if (e.error?.code === 'ENOENT') {
+            // Keep manual mounting/deletion usable when cron is not installed.
+            if (allowMissing) return null;
+            throw new Error('crontab is not installed; install it to enable auto-mount');
+        }
+        throw new Error(`Could not read crontab: ${e.stderr || e.error?.message || e.message}`);
+    }
+}
+
+async function removeRemoteCron(remoteName) {
+    const content = await readCrontab(true);
+    if (content === null) return null;
+    if (!isCronEntryFor(content, remoteName)) return false;
+    const kept = content.split('\n').filter(line => !isCronLineFor(line, remoteName));
+    try {
+        await writeCrontab(kept.join('\n'));
+    } catch (e) {
+        throw new Error(`Could not update crontab for '${remoteName}': ${e.stderr || e.error?.message || e.message}`);
+    }
+    return true;
+}
+
+const CRONTAB_UNAVAILABLE_WARNING = 'crontab is unavailable; any existing auto-mount entries must be removed manually.';
 
 function writeCrontab(content) {
     const tempFile = path.join(os.tmpdir(), `de_rclone_cron_${process.pid}_${Date.now()}`);
@@ -415,13 +506,12 @@ ipcMain.handle('add_to_cron', async (event, { remoteName, configPathOpt }) => {
 
         // Read the existing crontab and append the new line verbatim. Passing the
         // entry through a shell would expand $(seq ...) and strip its quotes.
-        const list = await execFilePromise('crontab', ['-l']).catch(() => ({ stdout: '' }));
-        const existing = (list.stdout || '').replace(/\n+$/, '');
+        const existing = await readCrontab();
         if (isCronEntryFor(existing, remoteName)) {
             return { success: true, message: `${remoteName} is already enabled for auto-mount.` };
         }
 
-        const content = (existing ? existing + '\n' : '') + cronEntry + '\n';
+        const content = existing + (existing && !existing.endsWith('\n') ? '\n' : '') + cronEntry + '\n';
         await writeCrontab(content);
         return { success: true, message: `Enabled auto-mount for ${remoteName}.` };
     } catch (e) {
@@ -431,16 +521,9 @@ ipcMain.handle('add_to_cron', async (event, { remoteName, configPathOpt }) => {
 
 ipcMain.handle('remove_from_cron', async (event, { remoteName, configPathOpt }) => {
     try {
-        const list = await execFilePromise('crontab', ['-l']).catch(() => ({ stdout: '' }));
-        const content = list.stdout || '';
-        if (!isCronEntryFor(content, remoteName)) {
-            return { success: true, message: `${remoteName} is not enabled for auto-mount.` };
-        }
-
-        const lines = content.replace(/\n$/, '').split('\n');
-        const newLines = lines.filter(line => !(line.includes('rclone mount') && line.includes(`${remoteName}:`)));
-        await writeCrontab(newLines.join('\n') + (newLines.length > 0 ? '\n' : ''));
-        return { success: true, message: `Disabled auto-mount for ${remoteName}.` };
+        const removed = await removeRemoteCron(remoteName);
+        if (removed === null) return { success: true, message: CRONTAB_UNAVAILABLE_WARNING };
+        return { success: true, message: removed ? `Disabled auto-mount for ${remoteName}.` : `${remoteName} is not enabled for auto-mount.` };
     } catch (e) {
         return { success: false, message: `Failed to disable auto-mount: ${e.stderr || e.error?.message || e.message}` };
     }
@@ -562,7 +645,7 @@ ipcMain.handle('add_remote_with_plugin', async (event, { pluginName, config, con
         newBlock += `${key} = ${value}\n`;
     }
 
-    fs.writeFileSync(configPath, currentConfigContent + newBlock);
+    writeRcloneConfig(configPath, currentConfigContent + newBlock);
 
     return { success: true, message: `Successfully added remote '${remoteName}'` };
 });
@@ -660,7 +743,7 @@ ipcMain.handle('update_remote_with_plugin', async (event, { remoteName, pluginNa
 
     const block = [`[${newName}]`, ...keys.map(key => `${key} = ${merged[key]}`)];
     const newContent = [...before, ...block, ...(after.length ? ['', ...after] : [])].join('\n') + '\n';
-    fs.writeFileSync(configPath, newContent);
+    writeRcloneConfig(configPath, newContent);
 
     return { success: true, message: `Remote '${newName}' updated successfully` };
 });
@@ -673,6 +756,12 @@ ipcMain.handle('delete_remote', async (event, { remoteName, configPathOpt }) => 
 
     try {
         const content = fs.readFileSync(configPath, 'utf8');
+        getMountDir(remoteName);
+        if (!getConfigSections(content).some(section => section.name === remoteName)) {
+            throw new Error(`Remote '${remoteName}' not found in the config`);
+        }
+        await unmountRemote(remoteName);
+        const cronRemoved = await removeRemoteCron(remoteName);
         const lines = content.split('\n');
         const newLines = [];
         let deleting = false;
@@ -693,8 +782,8 @@ ipcMain.handle('delete_remote', async (event, { remoteName, configPathOpt }) => 
             }
         }
 
-        fs.writeFileSync(configPath, newLines.join('\n'));
-        return { success: true, message: `Deleted remote ${remoteName}` };
+        writeRcloneConfig(configPath, newLines.join('\n'));
+        return { success: true, message: `Deleted remote ${remoteName}${cronRemoved === null ? `. Warning: ${CRONTAB_UNAVAILABLE_WARNING}` : ''}` };
     } catch (e) {
         return { success: false, message: `Failed to delete remote: ${e.message}` };
     }
@@ -781,18 +870,20 @@ ipcMain.handle('check_legacy_state', async () => {
 
     let legacyCrons = [];
     try {
-        const list = await execFilePromise('crontab', ['-l']).catch(() => ({ stdout: '' }));
+        const list = { stdout: await readCrontab(true) };
         if (list.stdout) {
             legacyCrons = list.stdout.split('\n').filter(isLegacyCronLine);
         }
-    } catch (e) {}
+    } catch (e) {
+        throw new Error(`Failed to check legacy crontab: ${e.message}`);
+    }
 
     return { mounts, legacyCrons };
 });
 
 ipcMain.handle('remove_legacy_crons', async () => {
     try {
-        const list = await execFilePromise('crontab', ['-l']).catch(() => ({ stdout: '' }));
+        const list = { stdout: await readCrontab(true) };
         if (!list.stdout) return { success: true, count: 0 };
 
         const lines = list.stdout.split('\n');

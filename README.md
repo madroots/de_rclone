@@ -30,6 +30,20 @@ A robust, retro-styled GUI manager for **Rclone**, styled with the nostalgic CS 
 - **Linux Native**  
   Optimized for Linux with AppImage distribution.
 
+### Managing remotes
+
+- Right-click a remote to **Edit**, **Delete**, or toggle auto-mount.
+- Use the settings gear to select a custom `rclone.conf`.
+- Deleting a remote first unmounts its managed mount, removes its empty mount
+  directory, and removes matching auto-mount jobs. Other remotes and cron jobs
+  are left unchanged. Remote data is not deleted.
+- If unmounting or cron cleanup fails, the remote configuration is kept for
+  retry. A failed cron cleanup can leave the remote already unmounted.
+- If `crontab` is not installed, deletion remains available but warns that any
+  existing auto-mount jobs must be removed manually.
+- Configuration files written by the app are restricted to their owner
+  (`0600`), including previously shared-readable files.
+
 ---
 
 ## Quick Start
@@ -66,6 +80,41 @@ To take advantage of an update mechanism of Gear Lever and update de_rclone auto
 ## Prerequisites
 *   **Rclone**: You must have `rclone` installed on your system.
 *   **FUSE**: Required for mounting drives (usually pre-installed on most distros).
+*   **mountpoint**: Provided by util-linux; required to verify mount state.
+*   **crontab**: Optional for manual remote management; required for auto-mount.
+
+## Development
+
+Use Node.js 24 LTS, plus the runtime prerequisites above:
+
+```bash
+npm ci
+npm run check
+npm test
+npm start
+```
+
+Build an AppImage without publishing a release:
+
+```bash
+npm run dist -- --linux AppImage --publish never
+```
+
+The package includes runtime code, provider plugins, UI assets, and the license.
+Tests, CSS backups, and previous build output are not bundled.
+
+### Releases
+
+Commit matching versions in `package.json` and `package-lock.json` before pushing
+a `v<version>` tag. CI rejects mismatched tags, checks syntax, runs regression
+tests, and builds the AppImage. Tagged builds publish a non-draft release,
+preserving existing release notes or generating notes from GitHub when empty.
+Pull requests and ordinary branch builds never publish releases.
+
+Electron and electron-builder are pinned in the lockfile. Run `npm audit` when
+updating them; the current toolchain still reports moderate transitive minimatch
+advisories. Do not use `npm audit fix --force` to downgrade the builder.
+
 ---
 ## Credits
 *   **Development**: [madroots](https://github.com/madroots)

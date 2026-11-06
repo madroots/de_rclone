@@ -1692,7 +1692,7 @@ function loadPluginFieldsForEdit(plugin, remoteConfig) {
 
 // Handle deleting a remote
 async function handleDeleteRemote(remote) {
-  showConfirmModal('Delete Remote', `Are you sure you want to delete remote '${escapeHtml(remote.name)}'?\n\nThis action cannot be undone.`, async () => {
+  showConfirmModal('Delete Remote', `Delete remote '${escapeHtml(remote.name)}'?\n\nThis will unmount its managed mount and disable auto-mount before removing its configuration. If cleanup fails, the configuration is kept so you can retry.\n\nThis action cannot be undone.`, async () => {
     try {
       // Get the config path from localStorage or use default (null)
       const configPath = localStorage.getItem('rcloneConfigPath') || null;

@@ -5,7 +5,8 @@ const { execFile, spawn } = require('child_process');
 const os = require('os');
 const { AppError } = require('./lib/errors');
 const mountinfo = require('./lib/mountinfo');
-const { createCrontabClient, isCronLineFor, isCronEntryFor } = require('./lib/crontab');
+const { createCrontabClient } = require('./lib/crontab');
+const { buildManagedLine, findEntries, removeLines, removeManaged } = require('./lib/cronentries');
 const { assertPlainConfig, writeConfigAtomic } = require('./lib/configguard');
 const { createOperationLocks, busyMessage } = require('./lib/oplock');
 
@@ -134,7 +135,8 @@ ipcMain.handle('get_remotes', async (event, { configPathOpt }) => {
             mounted: MOUNT_LABELS[st.state],
             mount_state: st.state,
             mount_note: st.message || '',
-            cron: cronKnown ? (isCronEntryFor(cron.content, name) ? 'Yes' : 'No') : 'Unknown',
+            cron: cronKnown ? CRON_LABELS[cronStateOf(cron.content, name)] : 'Unknown',
+            cron_state: cronKnown ? cronStateOf(cron.content, name) : 'unknown',
             cron_note: cronKnown ? '' : `auto-mount status unavailable: ${cronProblem(cron)}`,
             mount_point: st.mountPoint
         };
@@ -188,11 +190,6 @@ app.on('before-quit', async (event) => {
     }
     app.quit();
 });
-
-// Quote a value for /bin/sh. Cron runs the generated line through a shell.
-function shellQuote(value) {
-    return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
 
 function validateRemoteName(name) {
     if (!name) throw new Error("remote_name is required");
@@ -523,20 +520,6 @@ ipcMain.handle('get_available_plugins', async () => {
 
 // --- Cron Functions ---
 
-function getMountCmdString(remoteName, mountPoint, configPath) {
-    // Construct the exact command line used for cron. Values are shell-quoted
-    // here because cron runs the line through /bin/sh.
-    // We add a retry loop for mkdir because on headless boots without loginctl enable-linger,
-    // the XDG_RUNTIME_DIR might not be created immediately by systemd.
-    const remote = shellQuote(`${remoteName}:`);
-    const mount = shellQuote(mountPoint);
-    let cmd = `for i in $(seq 1 30); do mkdir -p ${mount} 2>/dev/null && break; sleep 2; done; rclone mount ${remote} ${mount} --vfs-cache-mode writes --daemon`;
-    if (configPath) {
-        cmd += ` --config ${shellQuote(configPath)}`;
-    }
-    return cmd;
-}
-
 const crontab = createCrontabClient({ execFile });
 
 function cronProblem(state) {
@@ -573,12 +556,22 @@ function cronEditError(outcome, action) {
     }
 }
 
-function withoutCronEntries(remoteName) {
-    return (content) => {
-        if (!isCronEntryFor(content, remoteName)) return null;
-        return content.split('\n').filter(line => !isCronLineFor(line, remoteName)).join('\n');
-    };
+// 'managed' = a line this app wrote (marker); 'manual' = the user's own mount
+// entry, which is reported but never edited without explicit selection.
+const CRON_LABELS = { managed: 'Yes', manual: 'Manual', none: 'No', unknown: 'Unknown' };
+function cronStateOf(content, remoteName) {
+    const { managed, manual } = findEntries(content, remoteName);
+    return managed.length ? 'managed' : manual.length ? 'manual' : 'none';
 }
+
+ipcMain.handle('get_cron_entries', async (event, { remoteName }) => {
+    const cron = await crontab.read();
+    if (cron.status === 'ok' || cron.status === 'empty') {
+        const { managed, manual } = findEntries(cron.content, remoteName);
+        return { status: 'ok', managed, manual };
+    }
+    return { status: cron.status, managed: [], manual: [], note: cronProblem(cron) };
+});
 
 handleLocked('add_to_cron', { keys: ({ remoteName }) => ['crontab', `remote:${remoteName}`], operation: 'changing auto-mount' }, async (event, { remoteName, configPathOpt }) => {
     try {
@@ -587,21 +580,24 @@ handleLocked('add_to_cron', { keys: ({ remoteName }) => ['crontab', `remote:${re
         }
         const mountPoint = getMountDir(remoteName);
         const configPath = getRcloneConfigPath(configPathOpt);
-        const cmd = getMountCmdString(remoteName, mountPoint, configPath);
-        const cronEntry = `@reboot ${cmd} # Added by de_rclone: ${remoteName}`;
+        const line = buildManagedLine({ remoteName, mountPoint, configPath });
 
         // Append the new line verbatim; passing the entry through a shell would
         // expand $(seq ...) and strip its quotes.
-        const outcome = await crontab.edit(content =>
-            isCronEntryFor(content, remoteName)
-                ? null
-                : content + (content && !content.endsWith('\n') ? '\n' : '') + cronEntry + '\n');
+        const outcome = await crontab.edit(content => {
+            const { managed, manual } = findEntries(content, remoteName);
+            if (managed.length) return null;
+            if (manual.length) {
+                throw new AppError('CRON_MANUAL_EXISTS', `${remoteName} already has a cron entry written by hand, which is left untouched, so no second entry is added: ${manual[0]}`);
+            }
+            return content + (content && !content.endsWith('\n') ? '\n' : '') + line + '\n';
+        });
 
         if (outcome.outcome === 'unchanged') {
             return { success: true, message: `${remoteName} is already enabled for auto-mount.` };
         }
         if (outcome.outcome !== 'written') throw cronEditError(outcome, 'enable auto-mount');
-        if (!isCronEntryFor(outcome.after.content, remoteName)) {
+        if (findEntries(outcome.after.content, remoteName).managed.length === 0) {
             throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but the entry is not present when read back');
         }
         return { success: true, message: `Enabled auto-mount for ${remoteName}.` };
@@ -612,18 +608,30 @@ handleLocked('add_to_cron', { keys: ({ remoteName }) => ['crontab', `remote:${re
 
 handleLocked('remove_from_cron', { keys: ({ remoteName }) => ['crontab', `remote:${remoteName}`], operation: 'changing auto-mount' }, async (event, { remoteName, configPathOpt }) => {
     try {
-        const outcome = await crontab.edit(withoutCronEntries(remoteName));
+        // Only entries this app wrote are removed here; hand-written ones are never touched.
+        const outcome = await crontab.edit(content => {
+            const { content: next, removed } = removeManaged(content, remoteName);
+            return removed.length ? next : null;
+        });
         if (outcome.outcome === 'unavailable') {
             return { success: true, warning: true, message: cronUnavailableWarning(unavailableState(outcome)) };
         }
+        const manual = outcome.before ? findEntries(outcome.before.content, remoteName).manual : [];
+        const manualNote = manual.length ? ` A cron entry written by hand was left unchanged: ${manual[0]}` : '';
         if (outcome.outcome === 'unchanged') {
-            return { success: true, message: `${remoteName} is not enabled for auto-mount.` };
+            return {
+                success: true,
+                ...(manual.length ? { warning: true } : {}),
+                message: manual.length
+                    ? `${remoteName} has no auto-mount entry managed by de_rclone.${manualNote}`
+                    : `${remoteName} is not enabled for auto-mount.`
+            };
         }
         if (outcome.outcome !== 'written') throw cronEditError(outcome, 'disable auto-mount');
-        if (isCronEntryFor(outcome.after.content, remoteName)) {
+        if (findEntries(outcome.after.content, remoteName).managed.length > 0) {
             throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but the entry is still present when read back');
         }
-        return { success: true, message: `Disabled auto-mount for ${remoteName}.` };
+        return { success: true, ...(manual.length ? { warning: true } : {}), message: `Disabled auto-mount for ${remoteName}.${manualNote}` };
     } catch (e) {
         return failureFrom(e);
     }
@@ -870,13 +878,16 @@ handleLocked('update_remote_with_plugin', { keys: ({ remoteName, config }) => ['
     return { success: true, message: `Remote '${newName}' updated successfully` };
 });
 
-handleLocked('delete_remote', { keys: ({ remoteName }) => ['config', 'crontab', `remote:${remoteName}`], operation: 'deleting' }, async (event, { remoteName, configPathOpt, rollback = false }) => {
+handleLocked('delete_remote', { keys: ({ remoteName }) => ['config', 'crontab', `remote:${remoteName}`], operation: 'deleting' }, async (event, { remoteName, configPathOpt, rollback = false, removeManualCron = [] }) => {
     const configPath = getRcloneConfigPath(configPathOpt);
     if (!fs.existsSync(configPath)) {
         return { success: false, code: 'CONFIG_MISSING', message: 'Config file not found' };
     }
 
     try {
+        if (!Array.isArray(removeManualCron) || removeManualCron.some(line => typeof line !== 'string')) {
+            throw new AppError('INVALID_ARGUMENT', 'removeManualCron must be a list of cron lines');
+        }
         if (rollback && !createdThisSession.has(remoteName)) {
             throw new AppError('ROLLBACK_NOT_ALLOWED', `'${remoteName}' was not created in this session, so it is not removed automatically`);
         }
@@ -898,19 +909,38 @@ handleLocked('delete_remote', { keys: ({ remoteName }) => ['config', 'crontab', 
             if (st.state !== 'mounted' && st.state !== 'unmounted') throw refusalFor(remoteName, st);
             const cronNow = await crontab.read();
             if (cronNow.status === 'error') throw new AppError('CRON_ERROR', cronNow.message);
+            if (removeManualCron.length) {
+                // Only lines that are currently hand-written entries of this remote may be removed.
+                const manual = cronNow.status === 'ok' ? findEntries(cronNow.content, remoteName).manual : [];
+                if (removeManualCron.some(line => !manual.includes(line))) {
+                    throw new AppError('CRON_LINE_NOT_ELIGIBLE', 'A selected cron line is no longer a hand-written entry for this remote; nothing was changed. Reopen the dialog and retry.');
+                }
+            }
         }
 
         let warning = '';
         if (!rollback) {
             await unmountRemote(remoteName);
-            const outcome = await crontab.edit(withoutCronEntries(remoteName));
+            // Managed entries go automatically; hand-written ones only if explicitly selected.
+            const outcome = await crontab.edit(content => {
+                const { managed, manual } = findEntries(content, remoteName);
+                const doomed = [...managed, ...removeManualCron.filter(line => manual.includes(line))];
+                return doomed.length ? removeLines(content, doomed) : null;
+            });
             if (outcome.outcome === 'unavailable') {
                 warning = cronUnavailableWarning(unavailableState(outcome));
-            } else if (outcome.outcome === 'written') {
-                if (isCronEntryFor(outcome.after.content, remoteName)) {
-                    throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but the entry is still present when read back');
+            } else if (outcome.outcome === 'written' || outcome.outcome === 'unchanged') {
+                if (outcome.outcome === 'written') {
+                    const after = findEntries(outcome.after.content, remoteName);
+                    if (after.managed.length > 0 || removeManualCron.some(line => after.manual.includes(line))) {
+                        throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but an entry is still present when read back');
+                    }
                 }
-            } else if (outcome.outcome !== 'unchanged') {
+                const kept = findEntries(outcome.before.content, remoteName).manual.filter(line => !removeManualCron.includes(line));
+                if (kept.length) {
+                    warning = `cron entries written by hand were left in place (${kept.length}): ${kept.join(' | ')}`;
+                }
+            } else {
                 throw cronEditError(outcome, 'remove the auto-mount entry');
             }
         }

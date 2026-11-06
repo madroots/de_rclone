@@ -1495,9 +1495,11 @@ function createContextMenu(x, y, remote) {
   menu.style.minWidth = '200px';
   menu.style.maxWidth = '250px';
 
-  // Determine cron action
-  const isCron = remote.cron === "Yes";
-  const cronAction = isCron ? "Disable auto-mount" : "Enable auto-mount";
+  // 'managed' = written by de_rclone; 'manual' = the user's own cron entry, which
+  // de_rclone reports but never edits; anything else offers to enable auto-mount.
+  const cronState = remote.cron_state || (remote.cron === 'Yes' ? 'managed' : 'none');
+  const isCron = cronState === 'managed';
+  const cronAction = isCron ? 'Disable auto-mount' : cronState === 'manual' ? 'Auto-mount: written by hand' : 'Enable auto-mount';
   const cronIcon = isCron ? '<img src="cron_icon.svg" style="width: 16px; height: 16px; vertical-align: bottom; margin-right: 8px;">' : '<img src="cron_icon.svg" style="width: 16px; height: 16px; vertical-align: bottom; margin-right: 8px; opacity: 0.5;">';
 
   // Create menu content with proper CS16 styling
@@ -1527,6 +1529,12 @@ function createContextMenu(x, y, remote) {
   document.getElementById('menu-cron').addEventListener('click', async () => {
     menu.remove();
     try {
+      if (cronState === 'manual') {
+        const entries = await invoke('get_cron_entries', { remoteName: remote.name });
+        const lines = (entries.manual || []).map(line => `<div style="font-family: monospace; font-size: 0.85em; word-break: break-all; margin-top: 6px;">${escapeHtml(line)}</div>`).join('');
+        showGeneralModal('Auto-mount written by hand', `This remote is mounted at boot by a cron entry you wrote yourself. de_rclone will not change it; edit it with <code>crontab -e</code>.${lines}`);
+        return;
+      }
       const action = isCron ? 'remove_from_cron' : 'add_to_cron';
       const configPath = localStorage.getItem('rcloneConfigPath') || null;
 
@@ -1538,13 +1546,13 @@ function createContextMenu(x, y, remote) {
       });
 
       if (result.success) {
-        showStatus(result.message, 'success');
+        showStatus(result.message, result.warning ? 'warning' : 'success');
         await loadRemotes(); // Refresh table to show updated status
       } else {
-        showGeneralModal('Error', result.message);
+        showGeneralModal('Error', escapeHtml(result.message));
       }
     } catch (e) {
-      showGeneralModal('Error', `Operation failed: ${e.message || e}`);
+      showGeneralModal('Error', `Operation failed: ${escapeHtml(stripErrorCode(cleanIpcError(e)))}`);
     }
   });
 
@@ -1773,25 +1781,61 @@ function loadPluginFieldsForEdit(plugin, remoteConfig) {
   }
 }
 
-// Handle deleting a remote
+// Handle deleting a remote. Hand-written cron entries for the remote are listed
+// with unchecked boxes: they are only removed when explicitly ticked, and the
+// result always says which ones were kept.
 async function handleDeleteRemote(remote) {
-  showConfirmModal('Delete Remote', `Delete remote '${escapeHtml(remote.name)}'?\n\nThis will unmount its managed mount and disable auto-mount before removing its configuration. If cleanup fails, the configuration is kept so you can retry.\n\nThis action cannot be undone.`, async () => {
+  let manualLines = [];
+  try {
+    const entries = await invoke('get_cron_entries', { remoteName: remote.name });
+    if (entries && entries.status === 'ok') manualLines = entries.manual || [];
+  } catch (e) {
+    console.error('Could not list cron entries before delete:', e);
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'progress-modal';
+  modal.innerHTML = `
+    <div class="progress-modal-content">
+      <div class="progress-header"><span class="progress-title">Delete Remote</span></div>
+      <div class="progress-body">
+        <div class="progress-message">
+          Delete remote '${escapeHtml(remote.name)}'?<br><br>
+          This will unmount its managed mount and disable its de_rclone auto-mount before removing its configuration. If cleanup fails, the configuration is kept so you can retry.
+          ${manualLines.length ? `<br><br><strong>Cron entries written by hand for this remote.</strong> They are kept unless you tick them:
+            <ul style="list-style: none; padding: 0; margin: 6px 0; max-height: 110px; overflow-y: auto;">
+              ${manualLines.map((line, i) => `<li><label style="font-family: monospace; font-size: 0.85em; word-break: break-all;"><input type="checkbox" class="delete-manual-cron" data-index="${i}"> ${escapeHtml(line)}</label></li>`).join('')}
+            </ul>` : ''}
+          <br><br>This action cannot be undone.
+        </div>
+        <div class="progress-content" style="justify-content: flex-end; padding-top: 10px;">
+          <button class="cs-btn" id="delete-cancel-btn" style="margin-right: 5px;">Cancel</button>
+          <button class="cs-btn" id="delete-ok-btn">Delete</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  document.getElementById('delete-cancel-btn').addEventListener('click', () => modal.remove());
+  document.getElementById('delete-ok-btn').addEventListener('click', async () => {
+    const removeManualCron = [...modal.querySelectorAll('.delete-manual-cron:checked')].map(el => manualLines[Number(el.dataset.index)]);
+    modal.remove();
     try {
       // Get the config path from localStorage or use default (null)
       const configPath = localStorage.getItem('rcloneConfigPath') || null;
 
-      // Call the backend to delete the remote
       const result = await invoke('delete_remote', {
         remoteName: remote.name,
-        configPathOpt: configPath
+        configPathOpt: configPath,
+        removeManualCron
       });
 
       if (result.success) {
-        showGeneralModal('Success', result.message);
+        showGeneralModal('Success', escapeHtml(result.message));
         // Reload remotes to reflect the change
         await loadRemotes();
       } else {
-        showGeneralModal('Error', result.message);
+        showGeneralModal('Error', escapeHtml(result.message));
       }
     } catch (error) {
       console.error('Error deleting remote:', error);

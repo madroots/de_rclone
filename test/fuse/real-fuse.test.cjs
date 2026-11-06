@@ -114,7 +114,8 @@ test('a busy mount cannot be unmounted or deleted; config and crontab stay intac
     const before = app.readConfig();
     assert.equal((await app.invoke('add_to_cron', { remoteName: 'plain' })).success, true);
     const cronBefore = app.cron.read();
-    assert.match(cronBefore, /Added by de_rclone: plain/);
+    const plainMarker = `# de_rclone:v2 remote=${Buffer.from('plain').toString('base64url')}`;
+    assert.ok(cronBefore.includes(plainMarker), 'add_to_cron wrote a managed (v2 marker) line');
     assert.equal((await app.invoke('mount_remote', { remoteName: 'plain' })).success, true);
     const mountPoint = app.mountDir('plain');
 
@@ -148,7 +149,7 @@ test('a busy mount cannot be unmounted or deleted; config and crontab stay intac
     assert.equal(app.mounts().length, 0);
     assert.doesNotMatch(app.readConfig().toString(), /\[plain\]/);
     assert.match(app.readConfig().toString(), /\[my remote\]/, 'the other remote is kept');
-    assert.doesNotMatch(app.cron.read(), /Added by de_rclone: plain/);
+    assert.doesNotMatch(app.cron.read(), /de_rclone:v2 remote=cGxhaW4/, 'the managed line went with the remote');
 });
 
 test('a foreign fuse-overlayfs mount at a managed path is never touched', { skip: skip || noOverlay }, async (t) => {
@@ -255,4 +256,43 @@ test('an encrypted config is refused and left byte-identical', { skip }, async (
 
     assert.deepEqual(app.readConfig(), encrypted, 'config bytes unchanged');
     assert.deepEqual(fs.readdirSync(path.dirname(app.configPath)), ['rclone.conf'], 'no temp files left next to it');
+});
+
+test('delete keeps hand-written cron lines and says so; removeManualCron removes exactly the selected ones', { skip }, async (t) => {
+    const app = createRealApp(t);
+    const unrelated = '0 5 * * * echo unrelated   ';
+    const handPlain = '@reboot rclone mount plain: /home/someone/mnt/plain --daemon';
+    const managedV1 = `@reboot rclone mount 'plain:' '/somewhere/plain' --daemon # Added by de_rclone: plain`;
+    const handSpaced = "@reboot rclone mount 'my remote:' /home/someone/mnt/spaced --daemon";
+    app.cron.set(`${unrelated}\n${handPlain}\n${managedV1}\n${handSpaced}\n`);
+
+    // Labels: a marker line makes it managed ("Yes"); a hand-written line alone is "Manual".
+    assert.equal((await entryFor(app, 'plain')).cron, 'Yes');
+    assert.equal((await entryFor(app, 'my remote')).cron, 'Manual');
+
+    // 1. Default delete: the managed v1 line goes, the hand-written line stays and is reported.
+    const kept = await app.invoke('delete_remote', { remoteName: 'plain' });
+    assert.equal(kept.success, true, JSON.stringify(kept));
+    assert.match(kept.message, /written by hand were left in place/);
+    assert.ok(kept.message.includes(handPlain), 'the message names the kept line');
+    assert.equal(app.cron.read(), `${unrelated}\n${handPlain}\n${handSpaced}\n`, 'only the managed line was removed');
+    assert.doesNotMatch(app.readConfig().toString(), /\[plain\]/);
+
+    // 2. A selected line that is not a hand-written entry of this remote refuses everything.
+    const configBefore = app.readConfig();
+    const cronBefore = app.cron.read();
+    for (const bad of [handPlain, unrelated, '@reboot rclone mount \'my remote:\' /not/in/crontab --daemon']) {
+        const refused = await app.invoke('delete_remote', { remoteName: 'my remote', removeManualCron: [bad] });
+        assert.equal(refused.success, false, bad);
+        assert.equal(refused.code, 'CRON_LINE_NOT_ELIGIBLE', JSON.stringify(refused));
+    }
+    assert.deepEqual(app.readConfig(), configBefore, 'config untouched by refusals');
+    assert.equal(app.cron.read(), cronBefore, 'crontab untouched by refusals');
+
+    // 3. With the line selected it is removed, and only it.
+    const removed = await app.invoke('delete_remote', { remoteName: 'my remote', removeManualCron: [handSpaced] });
+    assert.equal(removed.success, true, JSON.stringify(removed));
+    assert.doesNotMatch(removed.message, /left in place/);
+    assert.equal(app.cron.read(), `${unrelated}\n${handPlain}\n`, 'the selected line is gone; every other byte is kept');
+    assert.doesNotMatch(app.readConfig().toString(), /\[my remote\]/);
 });

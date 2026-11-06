@@ -30,7 +30,10 @@ const SUITES = [
     'test/remote-lifecycle.test.cjs',
     'test/mountinfo.test.cjs',
     'test/crontab.test.cjs',
-    'test/configguard.test.cjs'
+    'test/configguard.test.cjs',
+    'test/operations.test.cjs',
+    'test/cronentries.test.cjs',
+    'test/oplock.test.cjs'
 ];
 const COPY = ['lib', 'test', 'plugins', 'main.js', 'package.json'];
 const CONCURRENCY = 4;
@@ -88,19 +91,92 @@ const MUTATIONS = [
     },
     {
         name: 'cron-add-write-not-verified', file: 'main.js',
-        old: '        if (!isCronEntryFor(outcome.after.content, remoteName)) {', replacement: '        if (false) {'
+        old: '        if (findEntries(outcome.after.content, remoteName).managed.length === 0) {', replacement: '        if (false) {'
     },
     {
         name: 'cron-remove-write-not-verified', file: 'main.js',
-        old: '\n        if (isCronEntryFor(outcome.after.content, remoteName)) {', replacement: '\n        if (false) {'
+        old: "        if (findEntries(outcome.after.content, remoteName).managed.length > 0) {\n            throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but the entry is still present",
+        replacement: "        if (false) {\n            throw new AppError('CRON_VERIFY_FAILED', 'crontab accepted the change but the entry is still present"
     },
     {
         name: 'cron-delete-write-not-verified', file: 'main.js',
-        old: '\n                if (isCronEntryFor(outcome.after.content, remoteName)) {', replacement: '\n                if (false) {'
+        old: 'if (after.managed.length > 0 || removeManualCron.some(line => after.manual.includes(line))) {', replacement: 'if (false) {'
     },
     {
         name: 'mount-success-trusted-without-mount-table', file: 'main.js',
         old: "            if (now.state === 'mounted') {", replacement: '            if (true) {'
+    },
+
+    // --- main.js: operation locks, cancel, quit (#9) ---------------------------
+    {
+        name: 'handle-locked-bypasses-locks', file: 'main.js',
+        old: 'const outcome = await locks.run(keys(args || {}), operation, () => handler(event, args));',
+        replacement: 'const outcome = { busy: false, value: await handler(event, args) };'
+    },
+    {
+        name: 'cancel-test-does-not-kill-the-child', file: 'main.js',
+        old: "    if (entry.child) entry.child.kill('SIGTERM');", replacement: ''
+    },
+    {
+        name: 'cancelled-test-not-reported-as-cancelled', file: 'main.js',
+        old: "        if (entry.cancelled) return { success: false, cancelled: true, message: 'Connection test cancelled' };",
+        replacement: ''
+    },
+    {
+        name: 'before-quit-not-held-back', file: 'main.js',
+        old: '    event.preventDefault();\n    quitInProgress = true;', replacement: '    quitInProgress = true;'
+    },
+    {
+        name: 'delete-takes-no-per-remote-lock', file: 'main.js',
+        old: "keys: ({ remoteName }) => ['config', 'crontab', `remote:${remoteName}`], operation: 'deleting'",
+        replacement: "keys: () => ['config', 'crontab'], operation: 'deleting'"
+    },
+    {
+        name: 'add-to-cron-takes-no-crontab-lock', file: 'main.js',
+        old: "handleLocked('add_to_cron', { keys: ({ remoteName }) => ['crontab', `remote:${remoteName}`]",
+        replacement: "handleLocked('add_to_cron', { keys: ({ remoteName }) => [`remote:${remoteName}`]"
+    },
+
+    // --- main.js: managed vs hand-written cron entries (#7, #8) -----------------
+    {
+        name: 'disable-also-removes-manual-lines', file: 'main.js',
+        old: '            const { content: next, removed } = removeManaged(content, remoteName);\n            return removed.length ? next : null;',
+        replacement: '            const { content: next, removed } = removeManaged(content, remoteName);\n            return removed.length ? removeLines(next, findEntries(content, remoteName).manual) : null;'
+    },
+    {
+        name: 'add-to-cron-ignores-manual-entries', file: 'main.js',
+        old: "            if (manual.length) {\n                throw new AppError('CRON_MANUAL_EXISTS'",
+        replacement: "            if (false) {\n                throw new AppError('CRON_MANUAL_EXISTS'"
+    },
+    {
+        name: 'delete-removes-selected-lines-without-eligibility-check', file: 'main.js',
+        old: 'if (removeManualCron.some(line => !manual.includes(line))) {', replacement: 'if (false) {'
+    },
+    {
+        name: 'legacy-cron-removal-ignores-selection', file: 'main.js',
+        old: 'if (at !== -1 && isLegacyCronLine(line)) {', replacement: 'if (isLegacyCronLine(line)) {'
+    },
+    {
+        name: 'legacy-cron-removal-ignores-legacy-check', file: 'main.js',
+        old: 'if (at !== -1 && isLegacyCronLine(line)) {', replacement: 'if (at !== -1) {'
+    },
+    {
+        name: 'legacy-unmount-allows-paths-not-in-mount-table', file: 'main.js',
+        old: '        if (!allowed.has(mountPoint)) {', replacement: '        if (false) {'
+    },
+    {
+        name: 'legacy-cron-line-counts-comments', file: 'main.js',
+        old: '    if (/^\\s*#/.test(line)) return false; // a comment is never an entry\n', replacement: ''
+    },
+
+    // --- lib/cronentries.js ----------------------------------------------------
+    {
+        name: 'cronentries-percent-not-escaped', file: 'lib/cronentries.js',
+        old: "        if (ch === '%') {", replacement: '        if (false) {'
+    },
+    {
+        name: 'cronentries-managed-marker-name-not-compared', file: 'lib/cronentries.js',
+        old: 'if (v2) return decodeRemote(v2[1]) === remoteName;', replacement: 'if (v2) return decodeRemote(v2[1]) !== null;'
     },
 
     // --- lib/mountinfo.js ------------------------------------------------------
@@ -157,7 +233,9 @@ function runSuites(cwd, home) {
         child.stdout.on('data', (d) => { output += d; });
         child.stderr.on('data', (d) => { output += d; });
         child.on('close', (code) => {
-            const failed = Number((output.match(/^ℹ fail (\d+)/m) || [])[1] || 0);
+            // node:test reports a timed-out test as "cancelled", not as "fail".
+            const failed = Number((output.match(/^ℹ fail (\d+)/m) || [])[1] || 0)
+                + Number((output.match(/^ℹ cancelled (\d+)/m) || [])[1] || 0);
             const passed = Number((output.match(/^ℹ pass (\d+)/m) || [])[1] || 0);
             resolve({ code, failed, passed, output });
         });

@@ -754,14 +754,14 @@ test('programmer errors (bad argument types) throw TypeError before touching the
 // ---------------------------------------------------------------- integration with the real rclone binary
 
 const hasRclone = spawnSync('rclone', ['version'], { stdio: 'ignore' }).status === 0;
+// `rclone config encryption` appeared in newer releases (the apt rclone 1.60 lacks it).
+const canEncryptConfig = hasRclone && /\bencryption\b/.test(spawnSync('rclone', ['config', '--help'], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: os.tmpdir() } }).stdout || '');
 
-test('integration: real rclone validates add/delete and refuses a real encrypted config', { skip: hasRclone ? false : 'rclone not on PATH' }, async (t) => {
+// Isolated environment: rclone must never see the developer's HOME or config.
+function realRclone(t) {
     const home = tmpDir(t);
     const cfgDir = path.join(home, 'cfg');
     fs.mkdirSync(cfgDir);
-    const cfg = path.join(cfgDir, 'rclone.conf');
-
-    // Isolated environment: rclone must never see the developer's HOME or config.
     const env = { PATH: process.env.PATH, HOME: home, TMPDIR: home };
     const run = (args, options = {}) => new Promise((resolve, reject) => {
         execFile('rclone', args, { ...options, env, encoding: 'utf8' }, (error, stdout, stderr) => {
@@ -769,7 +769,12 @@ test('integration: real rclone validates add/delete and refuses a real encrypted
             else resolve({ stdout, stderr });
         });
     });
-    const dump = async (file) => JSON.parse((await run(['--config', file, '--ask-password=false', 'config', 'dump'])).stdout);
+    return { cfgDir, run, dump: async (file) => JSON.parse((await run(['--config', file, '--ask-password=false', 'config', 'dump'])).stdout) };
+}
+
+test('integration: real rclone validates add/delete and refuses corrupting writes', { skip: hasRclone ? false : 'rclone not on PATH' }, async (t) => {
+    const { cfgDir, run, dump } = realRclone(t);
+    const cfg = path.join(cfgDir, 'rclone.conf');
 
     // add to a brand-new file
     const first = '[a]\ntype = local\n';
@@ -796,7 +801,11 @@ test('integration: real rclone validates add/delete and refuses a real encrypted
     assert.equal(fs.readFileSync(cfg, 'utf8'), third);
     assert.deepEqual(fs.readdirSync(cfgDir), ['rclone.conf']);
 
-    // a real encrypted config
+});
+
+test('integration: a config encrypted by real rclone is refused and left byte-identical', { skip: canEncryptConfig ? false : 'rclone is missing or too old for `config encryption`' }, async (t) => {
+    const { cfgDir, run } = realRclone(t);
+    const third = '[b]\ntype = local\nnounc = true\n';
     const encPath = path.join(cfgDir, 'encrypted.conf');
     fs.writeFileSync(encPath, third);
     await run(['--config', encPath, 'config', 'encryption', 'set', '--password-command', 'echo pw']);
@@ -808,5 +817,5 @@ test('integration: real rclone validates add/delete and refuses a real encrypted
         configPath: encPath, original: encrypted, content: `${third}[c]\ntype = local\n`, changedNames: ['c'], runRclone: run,
     }), 'CONFIG_ENCRYPTED');
     assert.ok(Buffer.compare(fs.readFileSync(encPath), bytes) === 0);
-    assert.deepEqual(fs.readdirSync(cfgDir).sort(), ['encrypted.conf', 'rclone.conf']);
+    assert.deepEqual(fs.readdirSync(cfgDir), ['encrypted.conf']);
 });

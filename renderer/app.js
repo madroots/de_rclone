@@ -602,7 +602,7 @@ async function mountSelected() {
   resetOperationCancellation(); // Reset cancellation flag
 
   // Show progress modal with cancel button
-  const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Cancel', remoteName, 'mount');
+  const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Please wait...', remoteName, 'mount');
 
   try {
     // The backend waits for rclone's own mount readiness (up to 60s) and reports
@@ -687,12 +687,14 @@ async function unmountSelected() {
   resetOperationCancellation(); // Reset cancellation flag
 
   // Show progress modal with cancel button
-  const modal = showProgressDialog(`${recovering ? 'Recovering' : 'Unmounting'} ${remoteName}...`, 'Cancel', remoteName, 'unmount');
+  const modal = showProgressDialog(`${recovering ? 'Recovering' : 'Unmounting'} ${remoteName}...`, 'Please wait...', remoteName, 'unmount');
 
   try {
-    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
+    // The backend owns the real timeouts (each unmount tool is bounded, worst case
+    // about 75s); this guard only outlasts them so the UI never reports a timeout
+    // for something that is still going to finish.
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Unmount operation timed out after 10 seconds')), 10000);
+      setTimeout(() => reject(new Error('Unmount operation timed out after 100 seconds')), 100000);
     });
 
     // Get the config path from localStorage or use default (null)
@@ -792,6 +794,7 @@ async function testSelected() {
 
   // Show progress modal with cancel button
   const modal = showProgressDialog(`Testing connection to ${remoteName}...`, 'Cancel', remoteName, 'test');
+  modal.operation.requestId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now() + Math.random());
 
   try {
     // Create a timeout promise that rejects after 15 seconds (backend caps at 12s)
@@ -803,7 +806,7 @@ async function testSelected() {
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('test_connection', { remoteName, configPathOpt: configPath }),
+      invoke('test_connection', { remoteName, configPathOpt: configPath, requestId: modal.operation.requestId }),
       timeoutPromise
     ]);
 
@@ -874,6 +877,10 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
     operationMessage = `Establishing network connection to ${remoteName}...`;
   }
 
+  // Mount and unmount cannot be cancelled once started (rclone has forked its
+  // daemon / the unmount tool is running), so the button stays disabled until the
+  // real result arrives instead of claiming a cancellation that did not happen.
+  const locked = operationType === 'mount' || operationType === 'unmount';
   modal.innerHTML = `
     <div class="progress-modal-content">
       <div class="progress-header">
@@ -885,7 +892,7 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
           <div class="cs-progress-bar" style="flex: 1;">
             <div class="bars" style="width: 1%"></div>
           </div>
-          <button class="cs-btn progress-cancel-btn">${cancelText}</button>
+          <button class="cs-btn progress-cancel-btn" ${locked ? 'disabled' : ''}>${cancelText}</button>
         </div>
       </div>
     </div>
@@ -906,6 +913,10 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
   cancelBtn.addEventListener('click', () => {
     modal.operation.cancelled = true;
     cancelCurrentOperation();
+    // A connection test is really cancelled: the backend kills its rclone process.
+    if (modal.operation.type === 'test' && modal.operation.requestId) {
+      invoke('cancel_test', { requestId: modal.operation.requestId }).catch(() => { });
+    }
     // Update the modal immediately to show cancellation
     updateProgressModal(modal, 'Cancelled', 'Operation was cancelled', 'OK', 'cancelled');
   });
@@ -926,6 +937,7 @@ function updateProgressModal(modal, title, message, buttonText, resultType) {
   titleElement.textContent = title;
   messageElement.textContent = message;
   cancelButton.textContent = buttonText;
+  cancelButton.disabled = false;
 
   // Make the progress bar jump to 100% in all scenarios and keep it visible
   if (progressBar) {

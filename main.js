@@ -7,6 +7,7 @@ const { AppError } = require('./lib/errors');
 const mountinfo = require('./lib/mountinfo');
 const { createCrontabClient, isCronLineFor, isCronEntryFor } = require('./lib/crontab');
 const { assertPlainConfig, writeConfigAtomic } = require('./lib/configguard');
+const { createOperationLocks, busyMessage } = require('./lib/oplock');
 
 let mainWindow;
 
@@ -140,10 +141,12 @@ ipcMain.handle('get_remotes', async (event, { configPathOpt }) => {
     }));
 });
 
-// Helper for execFile (no shell — args passed verbatim) to promise
+// Helper for execFile (no shell — args passed verbatim) to promise. The child
+// process is exposed as `.child` so a caller can cancel it.
 function execFilePromise(file, args, options = {}) {
-    return new Promise((resolve, reject) => {
-        execFile(file, args, options, (error, stdout, stderr) => {
+    let child;
+    const promise = new Promise((resolve, reject) => {
+        child = execFile(file, args, options, (error, stdout, stderr) => {
             if (error) {
                 reject({ error, stderr, stdout });
                 return;
@@ -151,7 +154,40 @@ function execFilePromise(file, args, options = {}) {
             resolve({ stdout, stderr });
         });
     });
+    promise.child = child;
+    return promise;
 }
+
+// --- Operation locks ---
+// Operations that change state take non-blocking locks on what they touch (the
+// remote, the config, the crontab). A conflicting request is refused at once with
+// code BUSY instead of racing the running one, whichever window or IPC caller
+// it comes from.
+const locks = createOperationLocks();
+
+function handleLocked(channel, { keys, operation, onBusy = 'result' }, handler) {
+    ipcMain.handle(channel, async (event, args) => {
+        const outcome = await locks.run(keys(args || {}), operation, () => handler(event, args));
+        if (!outcome.busy) return outcome.value;
+        const message = busyMessage(outcome);
+        if (onBusy === 'throw') throw new AppError('BUSY', message);
+        return { success: false, code: 'BUSY', message };
+    });
+}
+
+// Let in-flight changes finish (bounded) before the app exits, so a quit does not
+// cut a mount, unmount or config write in half.
+let quitInProgress = false;
+app.on('before-quit', async (event) => {
+    if (quitInProgress || locks.snapshot().length === 0) return;
+    event.preventDefault();
+    quitInProgress = true;
+    const result = await locks.waitIdle(8000);
+    if (!result.idle) {
+        console.error('Quitting with operations still running:', result.pending.map(p => `${p.key} (${p.operation})`).join(', '));
+    }
+    app.quit();
+});
 
 // Quote a value for /bin/sh. Cron runs the generated line through a shell.
 function shellQuote(value) {
@@ -274,7 +310,7 @@ function failureFrom(e, fallbackCode = 'OPERATION_FAILED') {
     return { success: false, code: e.code || fallbackCode, message: e.detail || e.message };
 }
 
-ipcMain.handle('mount_remote', async (event, { remoteName, configPathOpt }) => {
+handleLocked('mount_remote', { keys: ({ remoteName }) => [`remote:${remoteName}`], operation: 'mounting' }, async (event, { remoteName, configPathOpt }) => {
     const st = await getMountState(remoteName);
     if (st.state === 'mounted') {
         return { success: true, message: `${remoteName} is already mounted at ${st.mountPoint}` };
@@ -357,7 +393,7 @@ ipcMain.handle('mount_remote', async (event, { remoteName, configPathOpt }) => {
     return result;
 });
 
-ipcMain.handle('unmount_remote', async (event, { remoteName }) => {
+handleLocked('unmount_remote', { keys: ({ remoteName }) => [`remote:${remoteName}`], operation: 'unmounting' }, async (event, { remoteName }) => {
     try {
         const wasMounted = await unmountRemote(remoteName);
         return { success: wasMounted, message: wasMounted ? `Successfully unmounted ${remoteName}` : `${remoteName} is not mounted.` };
@@ -366,7 +402,7 @@ ipcMain.handle('unmount_remote', async (event, { remoteName }) => {
     }
 });
 
-ipcMain.handle('recover_mount', async (event, { remoteName }) => {
+handleLocked('recover_mount', { keys: ({ remoteName }) => [`remote:${remoteName}`], operation: 'recovering the mount' }, async (event, { remoteName }) => {
     try {
         await unmountRemote(remoteName, { recover: true });
         return { success: true, message: `Recovered the stale mount of ${remoteName}` };
@@ -387,15 +423,22 @@ ipcMain.handle('open_external', async (event, url) => {
     await shell.openExternal(url);
 });
 
-ipcMain.handle('test_connection', async (event, { remoteName, configPathOpt }) => {
+// Connection tests in flight, so the dialog's Cancel really stops the rclone process.
+const inflightTests = new Map();
+
+ipcMain.handle('test_connection', async (event, { remoteName, configPathOpt, requestId }) => {
     const configPath = getRcloneConfigPath(configPathOpt);
     const args = ['lsf', `${remoteName}:`];
     if (configPathOpt) args.push('--config', configPath);
 
+    const run = execFilePromise('rclone', args, { timeout: 12000, killSignal: 'SIGTERM' });
+    const entry = { child: run.child, cancelled: false };
+    if (requestId) inflightTests.set(requestId, entry);
     try {
-        await execFilePromise('rclone', args, { timeout: 12000, killSignal: 'SIGTERM' });
+        await run;
         return { success: true, message: `Connection to ${remoteName} successful` };
     } catch (e) {
+        if (entry.cancelled) return { success: false, cancelled: true, message: 'Connection test cancelled' };
         const timedOut = e.error?.killed || e.error?.signal === 'SIGTERM';
         const detail = (e.stderr || '').trim();
         return {
@@ -404,7 +447,17 @@ ipcMain.handle('test_connection', async (event, { remoteName, configPathOpt }) =
                 ? 'Connection test timed out after 12s'
                 : `Connection test failed: ${detail || e.error?.message || 'unknown error'}`
         };
+    } finally {
+        if (requestId) inflightTests.delete(requestId);
     }
+});
+
+ipcMain.handle('cancel_test', async (event, { requestId }) => {
+    const entry = inflightTests.get(requestId);
+    if (!entry) return { success: false, message: 'No such connection test is running' };
+    entry.cancelled = true;
+    if (entry.child) entry.child.kill('SIGTERM');
+    return { success: true };
 });
 
 // Latency check handler
@@ -527,7 +580,7 @@ function withoutCronEntries(remoteName) {
     };
 }
 
-ipcMain.handle('add_to_cron', async (event, { remoteName, configPathOpt }) => {
+handleLocked('add_to_cron', { keys: ({ remoteName }) => ['crontab', `remote:${remoteName}`], operation: 'changing auto-mount' }, async (event, { remoteName, configPathOpt }) => {
     try {
         if (/[\r\n]/.test(String(remoteName))) {
             throw new AppError('INVALID_NAME', 'Remote name contains unsupported characters');
@@ -557,7 +610,7 @@ ipcMain.handle('add_to_cron', async (event, { remoteName, configPathOpt }) => {
     }
 });
 
-ipcMain.handle('remove_from_cron', async (event, { remoteName, configPathOpt }) => {
+handleLocked('remove_from_cron', { keys: ({ remoteName }) => ['crontab', `remote:${remoteName}`], operation: 'changing auto-mount' }, async (event, { remoteName, configPathOpt }) => {
     try {
         const outcome = await crontab.edit(withoutCronEntries(remoteName));
         if (outcome.outcome === 'unavailable') {
@@ -654,7 +707,7 @@ function getConfigSections(content) {
     return sections;
 }
 
-ipcMain.handle('add_remote_with_plugin', async (event, { pluginName, config, configPathOpt }) => {
+handleLocked('add_remote_with_plugin', { keys: ({ config }) => ['config', `remote:${config && config.remote_name}`], operation: 'adding a remote', onBusy: 'throw' }, async (event, { pluginName, config, configPathOpt }) => {
     const pluginData = loadPluginData(pluginName);
     const allFields = getPluginFields(pluginData);
     const secretNames = getSecretFieldNames(pluginData);
@@ -709,7 +762,7 @@ ipcMain.handle('add_remote_with_plugin', async (event, { pluginName, config, con
     return { success: true, message: `Successfully added remote '${remoteName}'` };
 });
 
-ipcMain.handle('update_remote_with_plugin', async (event, { remoteName, pluginName, config, configPathOpt }) => {
+handleLocked('update_remote_with_plugin', { keys: ({ remoteName, config }) => ['config', `remote:${remoteName}`, `remote:${(config && config.remote_name) || remoteName}`], operation: 'editing', onBusy: 'throw' }, async (event, { remoteName, pluginName, config, configPathOpt }) => {
     const pluginData = loadPluginData(pluginName);
     const allFields = getPluginFields(pluginData);
     const secretNames = getSecretFieldNames(pluginData);
@@ -817,7 +870,7 @@ ipcMain.handle('update_remote_with_plugin', async (event, { remoteName, pluginNa
     return { success: true, message: `Remote '${newName}' updated successfully` };
 });
 
-ipcMain.handle('delete_remote', async (event, { remoteName, configPathOpt, rollback = false }) => {
+handleLocked('delete_remote', { keys: ({ remoteName }) => ['config', 'crontab', `remote:${remoteName}`], operation: 'deleting' }, async (event, { remoteName, configPathOpt, rollback = false }) => {
     const configPath = getRcloneConfigPath(configPathOpt);
     if (!fs.existsSync(configPath)) {
         return { success: false, code: 'CONFIG_MISSING', message: 'Config file not found' };
@@ -992,7 +1045,7 @@ ipcMain.handle('check_legacy_state', async () => {
 
 // Removes only the exact lines the user ticked in the dialog, and only if they are
 // still legacy entries. Nothing is removed that was not individually selected.
-ipcMain.handle('remove_legacy_crons', async (event, lines) => {
+handleLocked('remove_legacy_crons', { keys: () => ['crontab'], operation: 'cleaning up legacy entries' }, async (event, lines) => {
     if (!Array.isArray(lines) || lines.some(line => typeof line !== 'string')) {
         return { success: false, count: 0, error: 'expected the list of selected cron lines' };
     }
@@ -1026,7 +1079,7 @@ ipcMain.handle('remove_legacy_crons', async (event, lines) => {
     return { success: false, count: 0, error: cronEditError(outcome, 'remove legacy auto-mount entries').detail };
 });
 
-ipcMain.handle('unmount_legacy_mounts', async (event, paths) => {
+handleLocked('unmount_legacy_mounts', { keys: () => ['legacy-mounts'], operation: 'cleaning up legacy mounts' }, async (event, paths) => {
     if (!Array.isArray(paths)) {
         return { success: false, count: 0, results: [], error: 'expected a list of mount paths' };
     }

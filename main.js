@@ -945,6 +945,7 @@ function getLegacyDir() {
 }
 
 function isLegacyCronLine(line) {
+    if (/^\s*#/.test(line)) return false; // a comment is never an entry
     const legacyDir = getLegacyDir();
     return line.includes('rclone mount') && (
         line.includes(legacyDir + path.sep) ||
@@ -966,12 +967,15 @@ function legacyRcloneMounts(entries) {
 ipcMain.handle('check_legacy_state', async () => {
     // Mounts and crontab are checked independently: one failing never hides the other.
     let mounts = [];
+    let mountDetails = [];
     let mountsError = '';
     const table = await loadMountTable();
     if (table.error) {
         mountsError = table.error.message;
     } else {
-        mounts = legacyRcloneMounts(table.entries).map(entry => entry.mountPoint);
+        const found = legacyRcloneMounts(table.entries);
+        mounts = found.map(entry => entry.mountPoint);
+        mountDetails = found.map(entry => ({ path: entry.mountPoint, source: entry.source }));
     }
 
     let legacyCrons = [];
@@ -983,48 +987,72 @@ ipcMain.handle('check_legacy_state', async () => {
         cronNote = cronProblem(cron);
     }
 
-    return { mounts, legacyCrons, mountsError, cronNote };
+    return { mounts, mountDetails, legacyCrons, mountsError, cronNote };
 });
 
-ipcMain.handle('remove_legacy_crons', async () => {
+// Removes only the exact lines the user ticked in the dialog, and only if they are
+// still legacy entries. Nothing is removed that was not individually selected.
+ipcMain.handle('remove_legacy_crons', async (event, lines) => {
+    if (!Array.isArray(lines) || lines.some(line => typeof line !== 'string')) {
+        return { success: false, count: 0, error: 'expected the list of selected cron lines' };
+    }
+    if (lines.length === 0) return { success: true, count: 0 };
+
     let removed = 0;
     const outcome = await crontab.edit(content => {
-        const lines = content.split('\n');
-        const kept = lines.filter(line => !isLegacyCronLine(line));
-        removed = lines.length - kept.length;
-        return removed === 0 ? null : kept.join('\n').replace(/\n+$/, '') + '\n';
+        const pending = [...lines];
+        const kept = [];
+        removed = 0;
+        for (const line of content.split('\n')) {
+            const at = pending.indexOf(line);
+            if (at !== -1 && isLegacyCronLine(line)) {
+                pending.splice(at, 1);
+                removed++;
+            } else {
+                kept.push(line);
+            }
+        }
+        return removed === 0 ? null : kept.join('\n');
     });
-    if (outcome.outcome === 'unchanged') return { success: true, count: 0 };
-    if (outcome.outcome === 'unavailable') {
-        return { success: true, count: 0, warning: cronUnavailableWarning(unavailableState(outcome)) };
+    if (outcome.outcome === 'unchanged') {
+        return { success: false, count: 0, error: 'the selected entries are no longer in the crontab' };
     }
-    if (outcome.outcome === 'written') return { success: true, count: removed };
-    return { success: false, error: cronEditError(outcome, 'remove legacy auto-mount entries').detail };
+    if (outcome.outcome === 'unavailable') {
+        return { success: false, count: 0, error: cronUnavailableWarning(unavailableState(outcome)) };
+    }
+    if (outcome.outcome === 'written') {
+        return { success: removed === lines.length, count: removed, ...(removed === lines.length ? {} : { error: `${lines.length - removed} selected entries were no longer in the crontab` }) };
+    }
+    return { success: false, count: 0, error: cronEditError(outcome, 'remove legacy auto-mount entries').detail };
 });
 
 ipcMain.handle('unmount_legacy_mounts', async (event, paths) => {
     if (!Array.isArray(paths)) {
-        return { success: false, count: 0, error: 'expected a list of mount paths' };
+        return { success: false, count: 0, results: [], error: 'expected a list of mount paths' };
     }
     const table = await loadMountTable();
-    if (table.error) return { success: false, count: 0, error: table.error.message };
+    if (table.error) return { success: false, count: 0, results: [], error: table.error.message };
 
     // Only paths that the mount table currently reports as legacy rclone mounts.
     const allowed = new Set(legacyRcloneMounts(table.entries).map(entry => entry.mountPoint));
-    const targets = paths.filter(mountPoint => allowed.has(mountPoint));
-    let successCount = 0;
-    for (const mountPoint of targets) {
+    const results = [];
+    for (const mountPoint of paths) {
+        if (!allowed.has(mountPoint)) {
+            results.push({ path: mountPoint, ok: false, error: 'not a legacy rclone mount; left untouched' });
+            continue;
+        }
         try {
             await releaseMount(mountPoint, false);
             const after = await loadMountTable();
             if (after.error || legacyRcloneMounts(after.entries).some(entry => entry.mountPoint === mountPoint)) {
-                throw new Error('mount was not released');
+                throw new Error('the mount was not released; close programs using it and retry');
             }
             try { fs.rmdirSync(mountPoint); } catch (e) { }
-            successCount++;
+            results.push({ path: mountPoint, ok: true });
         } catch (e) {
-            console.error(`Legacy unmount failed for ${mountPoint}: ${e.detail || e.message}`);
+            results.push({ path: mountPoint, ok: false, error: e.detail || e.message });
         }
     }
-    return { success: successCount === paths.length, count: successCount };
+    const count = results.filter(r => r.ok).length;
+    return { success: count === paths.length, count, results };
 });

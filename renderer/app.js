@@ -147,34 +147,38 @@ async function checkLegacyState() {
     const state = await invoke('check_legacy_state');
     const hasMounts = state.mounts && state.mounts.length > 0;
     const hasCrons = state.legacyCrons && state.legacyCrons.length > 0;
-    
+
     if (hasMounts || hasCrons) {
-      showLegacyStateWarning(state.mounts || [], state.legacyCrons || []);
+      showLegacyStateWarning(state);
     }
   } catch (e) {
     console.error("Failed to check legacy state:", e);
   }
 }
 
-function showLegacyStateWarning(mounts, crons) {
+// Lists leftovers of the old ~/mnt setup. Nothing is selected by default and
+// nothing is removed unless the user ticks that exact item and confirms.
+function showLegacyStateWarning(state) {
+  const mounts = state.mountDetails || (state.mounts || []).map(path => ({ path, source: '' }));
+  const crons = state.legacyCrons || [];
   const modal = document.createElement('div');
   modal.className = 'progress-modal';
-  
+
+  const notes = [state.mountsError && `mounts: ${state.mountsError}`, state.cronNote && `crontab: ${state.cronNote}`].filter(Boolean);
   let detailsHtml = '';
   if (mounts.length > 0) {
     detailsHtml += `
-      <strong>Active Mounts (~/mnt):</strong>
-      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 80px; overflow-y: auto;">
-        ${mounts.map(m => `<li>${escapeHtml(m)}</li>`).join('')}
+      <strong>rclone mounts in ~/mnt:</strong>
+      <ul style="list-style: none; padding: 0; margin: 5px 0 10px; max-height: 100px; overflow-y: auto;">
+        ${mounts.map((m, i) => `<li><label><input type="checkbox" class="legacy-mount" data-index="${i}"> ${escapeHtml(m.path)}${m.source ? ` <span class="text-muted">(${escapeHtml(m.source)})</span>` : ''}</label></li>`).join('')}
       </ul>
     `;
   }
   if (crons.length > 0) {
     detailsHtml += `
-      <strong>Legacy Auto-mounts (Cron):</strong>
-      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 120px; overflow-y: auto;">
-        <li>Found ${crons.length} legacy cron entry(s):</li>
-        ${crons.map(entry => `<li style="font-family: monospace; font-size: 0.85em; word-break: break-all;">${escapeHtml(entry)}</li>`).join('')}
+      <strong>Legacy auto-mount entries (cron):</strong>
+      <ul style="list-style: none; padding: 0; margin: 5px 0 10px; max-height: 120px; overflow-y: auto;">
+        ${crons.map((entry, i) => `<li><label style="font-family: monospace; font-size: 0.85em; word-break: break-all;"><input type="checkbox" class="legacy-cron" data-index="${i}"> ${escapeHtml(entry)}</label></li>`).join('')}
       </ul>
     `;
   }
@@ -185,17 +189,16 @@ function showLegacyStateWarning(mounts, crons) {
         <span class="progress-title">Legacy Setup Detected</span>
       </div>
       <div class="progress-body" style="padding: 15px;">
-        <div class="progress-message" style="margin-bottom: 15px;">
+        <div class="progress-message" id="legacy-body" style="margin-bottom: 15px;">
           The mount location has been updated to $XDG_RUNTIME_DIR.<br/><br/>
-          We detected parts of the old setup that should be cleaned up:
+          These parts of the old setup are still present. Tick only the items you want removed:
           <div style="margin-top: 10px; font-size: 0.9em; text-align: left;">
             ${detailsHtml}
           </div>
-          <br/>
-          Would you like to clean them up now?
+          ${notes.length ? `<div class="text-muted" style="font-size: 0.85em;">${notes.map(escapeHtml).join('<br/>')}</div>` : ''}
         </div>
         <div class="progress-content" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
-          <button class="cs-btn" id="legacy-cleanup-btn">Clean Up All</button>
+          <button class="cs-btn" id="legacy-cleanup-btn" disabled>Remove selected</button>
           <button class="cs-btn" id="legacy-ignore-btn">Ignore</button>
         </div>
       </div>
@@ -204,31 +207,55 @@ function showLegacyStateWarning(mounts, crons) {
 
   document.body.appendChild(modal);
 
-  document.getElementById('legacy-cleanup-btn').addEventListener('click', async () => {
-    const cleanupBtn = document.getElementById('legacy-cleanup-btn');
+  const cleanupBtn = document.getElementById('legacy-cleanup-btn');
+  const selected = () => ({
+    mounts: [...modal.querySelectorAll('.legacy-mount:checked')].map(el => mounts[Number(el.dataset.index)].path),
+    crons: [...modal.querySelectorAll('.legacy-cron:checked')].map(el => crons[Number(el.dataset.index)])
+  });
+  const refreshButton = () => {
+    const { mounts: m, crons: c } = selected();
+    cleanupBtn.disabled = m.length + c.length === 0;
+    cleanupBtn.textContent = m.length + c.length === 0 ? 'Remove selected' : `Remove selected (${m.length + c.length})`;
+  };
+  modal.querySelectorAll('input[type="checkbox"]').forEach(el => el.addEventListener('change', refreshButton));
+
+  cleanupBtn.addEventListener('click', async () => {
+    const pick = selected();
     cleanupBtn.disabled = true;
-    cleanupBtn.textContent = "Cleaning...";
-    let success = true;
+    cleanupBtn.textContent = 'Removing...';
+    const lines = [];
+    let allOk = true;
 
     try {
-      if (mounts.length > 0) {
-        const mountResult = await invoke('unmount_legacy_mounts', mounts);
-        if (!mountResult.success) success = false;
+      if (pick.mounts.length > 0) {
+        const result = await invoke('unmount_legacy_mounts', pick.mounts);
+        for (const item of result.results || []) {
+          lines.push(`${item.ok ? 'Unmounted' : 'FAILED'}: ${item.path}${item.ok ? '' : ` (${item.error})`}`);
+        }
+        if (!result.success) {
+          allOk = false;
+          if (result.error) lines.push(`FAILED: ${result.error}`);
+        }
       }
-      if (crons.length > 0) {
-        const cronResult = await invoke('remove_legacy_crons');
-        if (!cronResult.success) success = false;
-      }
-
-      if (success) {
-        showStatus("Successfully cleaned up legacy setup.", "success");
-      } else {
-        showStatus("Some legacy components failed to clean up.", "warning");
+      if (pick.crons.length > 0) {
+        const result = await invoke('remove_legacy_crons', pick.crons);
+        if (result.success) {
+          lines.push(`Removed ${result.count} cron entr${result.count === 1 ? 'y' : 'ies'}`);
+        } else {
+          allOk = false;
+          lines.push(`FAILED: cron entries (${result.error || 'unknown error'})`);
+        }
       }
     } catch (e) {
-      showStatus("Failed during legacy cleanup: " + e.message, "error");
+      allOk = false;
+      lines.push(`FAILED: ${stripErrorCode(cleanIpcError(e))}`);
     }
-    modal.remove();
+
+    showStatus(allOk ? 'Removed the selected legacy items.' : 'Some selected legacy items could not be removed.', allOk ? 'success' : 'warning');
+    document.getElementById('legacy-body').innerHTML = lines.map(escapeHtml).join('<br/>');
+    modal.querySelector('.progress-content').innerHTML = '<button class="cs-btn" id="legacy-done-btn">OK</button>';
+    document.getElementById('legacy-done-btn').addEventListener('click', () => modal.remove());
+    loadRemotes();
   });
 
   document.getElementById('legacy-ignore-btn').addEventListener('click', () => {

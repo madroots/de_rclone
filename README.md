@@ -122,10 +122,20 @@ Tests, CSS backups, and previous build output are not bundled.
 ### Releases
 
 Commit matching versions in `package.json` and `package-lock.json` before pushing
-a `v<version>` tag. CI rejects mismatched tags, checks syntax, runs regression
-tests, and builds the AppImage. Tagged builds publish a non-draft release,
-preserving existing release notes or generating notes from GitHub when empty.
-Pull requests and ordinary branch builds never publish releases.
+a `v<version>` tag. CI runs `scripts/release-gate.cjs` (`npm run release:gate`)
+and fails before building when the tag is not `v<version>`, the two versions
+differ, or a *published* release already exists for the tag (electron-builder
+would skip the AppImage upload). A draft release for the tag, for example one
+holding hand-written notes, is fine.
+
+Tagged builds run in two jobs. The read-only `build` job checks syntax and runs
+regression tests. The `publish` job, the only one with `contents: write`, uploads
+the AppImage and `latest-linux.yml` to a draft release, verifies the draft holds
+both assets, and only then publishes it, keeping non-empty draft notes or
+generating notes from GitHub otherwise. To re-run a failed release, delete or
+reset the release to a draft first, or use a new tag. Pull requests and ordinary
+branch builds only build and upload an artifact; they never publish releases and
+run without a write token.
 
 Electron and electron-builder are pinned in the lockfile. Run `npm audit` when
 updating them; the current toolchain still reports moderate transitive minimatch

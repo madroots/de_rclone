@@ -11,6 +11,33 @@ let selectedRemote = null;
 // Operation tracking to prevent multiple simultaneous operations
 let isOperationInProgress = false;
 
+// Electron prefixes errors thrown by IPC handlers with "Error invoking remote
+// method '<name>': Error: "; handlers prefix their own typed errors with
+// "CODE: ". These helpers expose the readable text and the code.
+function cleanIpcError(error) {
+  const raw = error && typeof error === 'object' && error.message ? error.message : String(error);
+  return raw.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
+}
+
+function stripErrorCode(message) {
+  return message.replace(/^[A-Z][A-Z_]+: /, '');
+}
+
+// Remove a remote that this session just created. The backend only accepts
+// rollback for names it created itself, and the result is always checked: a
+// silent failure would leave a remote the user believes was discarded.
+async function rollbackNewRemote(remoteName, configPath) {
+  try {
+    const result = await invoke('delete_remote', { remoteName, configPathOpt: configPath, rollback: true });
+    if (result && result.success) return true;
+    showGeneralModal('Error', `Could not remove the new remote '${escapeHtml(remoteName)}': ${escapeHtml(result?.message || 'unknown error')}<br><br>It is still in your rclone config. Delete it from the right-click menu.`);
+  } catch (error) {
+    showGeneralModal('Error', `Could not remove the new remote '${escapeHtml(remoteName)}': ${escapeHtml(stripErrorCode(cleanIpcError(error)))}<br><br>It is still in your rclone config. Delete it from the right-click menu.`);
+  }
+  await loadRemotes();
+  return false;
+}
+
 // Escape values that come from rclone.conf before inserting them into HTML.
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -310,26 +337,32 @@ async function loadRemotes() {
       }
     }
 
-    const message = `Loaded ${remotes.length} remotes`;
+    const cronNotes = [...new Set(remotes.map(r => r.cron_note).filter(Boolean))];
+    const message = `Loaded ${remotes.length} remotes${cronNotes.length ? ` (${cronNotes.join('; ')})` : ''}`;
     defaultStatusMessage = message; // Update the default message
     showStatus(message, 'success', false); // Don't auto-reset the loaded message
   } catch (error) {
     console.error('Error loading remotes:', error);
-    // Handle error safely to avoid undefined error.message
-    const errorMessage = error && typeof error === 'object' && error.message ? error.message : String(error);
-    const displayMessage = `Error loading remotes: ${errorMessage}`;
-    // Don't reset defaultStatusMessage if it's the config not found specific message
-    if (!errorMessage.includes("rclone.conf not found")) {
-      defaultStatusMessage = "Ready"; // Reset to ready state on other errors
-    }
-    showStatus(displayMessage, 'error');
+    const errorMessage = cleanIpcError(error);
 
-    // Specific error message for common issues
-    if (errorMessage && errorMessage.includes("rclone.conf not found")) {
-      showStatus("rclone.conf not found. Select it from settings or add a new remote to create it.", 'warning', false); // Yellow and doesn't auto-reset
-      defaultStatusMessage = "rclone.conf not found. Select it from settings or add a new remote to create it."; // Keep this as the persistent message
-    } else if (errorMessage && errorMessage.includes("Failed to read config")) {
-      showStatus("Could not read rclone config. Check ~/.config/rclone/rclone.conf", 'warning', false); // Yellow and doesn't auto-reset
+    // Never leave rows from an earlier load on screen: they would pass for the
+    // current state of a config that can no longer be read.
+    if (remoteTableBody) remoteTableBody.innerHTML = '';
+    updateRemoteHeader(0);
+    selectedRemote = null;
+    updateButtonStates(null);
+
+    if (errorMessage.includes('rclone.conf not found')) {
+      const text = 'rclone.conf not found. Select it from settings or add a new remote to create it.';
+      showStatus(text, 'warning', false); // Yellow and doesn't auto-reset
+      defaultStatusMessage = text; // Keep this as the persistent message
+    } else if (errorMessage.startsWith('CONFIG_ENCRYPTED:')) {
+      const text = stripErrorCode(errorMessage);
+      showStatus(text, 'warning', false);
+      defaultStatusMessage = text;
+    } else {
+      defaultStatusMessage = 'Ready';
+      showStatus(`Error loading remotes: ${stripErrorCode(errorMessage)}`, 'error');
     }
   }
 }
@@ -467,15 +500,22 @@ function updateRemoteHeader(count) {
 function updateButtonStates(remote) {
   // Reset all buttons to disabled initially
   if (mountBtn) mountBtn.disabled = true;
-  if (unmountBtn) unmountBtn.disabled = true;
+  if (unmountBtn) {
+    unmountBtn.disabled = true;
+    unmountBtn.textContent = 'Unmount';
+  }
   if (openBtn) openBtn.disabled = true;
   if (testBtn) testBtn.disabled = true;
 
   // Only enable buttons if a remote is selected
   if (remote) {
-    if (mountBtn) mountBtn.disabled = remote.mounted === 'Yes';
-    if (unmountBtn) unmountBtn.disabled = remote.mounted !== 'Yes';
-    if (openBtn) openBtn.disabled = remote.mounted !== 'Yes';
+    const state = remote.mount_state || (remote.mounted === 'Yes' ? 'mounted' : 'unmounted');
+    if (mountBtn) mountBtn.disabled = state !== 'unmounted';
+    if (unmountBtn) {
+      unmountBtn.disabled = state !== 'mounted' && state !== 'stale';
+      unmountBtn.textContent = state === 'stale' ? 'Recover' : 'Unmount';
+    }
+    if (openBtn) openBtn.disabled = state !== 'mounted';
     if (testBtn) testBtn.disabled = false;
   }
 }
@@ -538,9 +578,11 @@ async function mountSelected() {
   const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Cancel', remoteName, 'mount');
 
   try {
-    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
+    // The backend waits for rclone's own mount readiness (up to 60s) and reports
+    // the real outcome; this guard must outlast it so the UI never reports a
+    // timeout for a mount that is still going to succeed.
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Mount operation timed out after 10 seconds')), 10000);
+      setTimeout(() => reject(new Error('Mount operation timed out after 70 seconds')), 70000);
     });
 
     // Get the config path from localStorage or use default (null)
@@ -614,10 +656,11 @@ async function unmountSelected() {
   }
 
   const remoteName = selectedRemote.name;
+  const recovering = selectedRemote.mount_state === 'stale';
   resetOperationCancellation(); // Reset cancellation flag
 
   // Show progress modal with cancel button
-  const modal = showProgressDialog(`Unmounting ${remoteName}...`, 'Cancel', remoteName, 'unmount');
+  const modal = showProgressDialog(`${recovering ? 'Recovering' : 'Unmounting'} ${remoteName}...`, 'Cancel', remoteName, 'unmount');
 
   try {
     // Create a timeout promise that rejects after 10 seconds to match test connection timeout
@@ -629,7 +672,7 @@ async function unmountSelected() {
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('unmount_remote', { remoteName, configPathOpt: configPath }),
+      invoke(recovering ? 'recover_mount' : 'unmount_remote', { remoteName, configPathOpt: configPath }),
       timeoutPromise
     ]);
 
@@ -1228,7 +1271,7 @@ async function addRemote() {
         }
 
         if (addCancelled) {
-          await invoke('delete_remote', { remoteName, configPathOpt: configPath }).catch(() => {});
+          await rollbackNewRemote(remoteName, configPath);
           return;
         }
 
@@ -1248,7 +1291,7 @@ async function addRemote() {
 
         // If the user cancelled while the test was running, remove the new remote.
         if (addCancelled) {
-          await invoke('delete_remote', { remoteName, configPathOpt: configPath }).catch(() => {});
+          await rollbackNewRemote(remoteName, configPath);
           return;
         }
 
@@ -1272,15 +1315,16 @@ async function addRemote() {
           await loadRemotes(); // Refresh the list
         } else {
           // The remote is written before the test; remove it when the user declines.
-          const deleted = await invoke('delete_remote', { remoteName, configPathOpt: configPath });
-          if (!deleted.success) {
-            showGeneralModal('Error', `Could not remove the new remote: ${deleted.message}`);
-          }
-          showStatus('Connection test failed. The remote was not saved.', 'warning');
+          const removed = await rollbackNewRemote(remoteName, configPath);
+          showStatus(
+            removed ? 'Connection test failed. The remote was not saved.'
+              : 'Connection test failed, and the new remote could not be removed.',
+            'warning'
+          );
         }
       } catch (error) {
         console.error('Error adding remote:', error);
-        showGeneralModal('Error', `Failed to add remote: ${error.message || error}`);
+        showGeneralModal('Error', `Failed to add remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
       } finally {
         if (document.contains(this)) {
           this.disabled = false;
@@ -1521,7 +1565,7 @@ async function handleEditRemote(remote) {
     if (error.message?.includes("not found in config")) {
       showGeneralModal('Error', `Remote '${remote.name}' not found in the config file anymore.`);
     } else {
-      showGeneralModal('Error', `Failed to edit remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to edit remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     }
   }
 }
@@ -1624,7 +1668,7 @@ async function openEditRemoteForm(remote, plugin, remoteConfig) {
       await loadRemotes(); // Refresh the list
     } catch (error) {
       console.error('Error updating remote:', error);
-      showGeneralModal('Error', `Failed to update remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to update remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     } finally {
       if (document.contains(saveBtn)) {
         saveBtn.disabled = false;
@@ -1712,7 +1756,7 @@ async function handleDeleteRemote(remote) {
       }
     } catch (error) {
       console.error('Error deleting remote:', error);
-      showGeneralModal('Error', `Failed to delete remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to delete remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     }
   });
 }

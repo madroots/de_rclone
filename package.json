@@ -32,6 +32,7 @@
     },
     "files": [
       "main.js",
+      "lib/**/*.js",
       "preload.js",
       "package.json",
       "LICENSE",

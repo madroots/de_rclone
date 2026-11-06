@@ -1,72 +1,13 @@
+'use strict';
+
+// Integration tests: the real main.js handlers against faithful fakes of the
+// kernel mount table, crontab, fusermount and rclone (see helpers/app-harness).
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
-const vm = require('node:vm');
-const { createRequire } = require('node:module');
-
-const root = path.resolve(__dirname, '..');
-const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
-const appRequire = createRequire(path.join(root, 'main.js'));
-
-function fixture(t, content = '[foo]\ntype = sftp\npass = stored-secret\n\n[prefixfoo]\ntype = sftp\npass = keep-secret\n') {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'de-rclone-test-'));
-    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const configPath = path.join(dir, 'config', 'rclone.conf');
-    fs.mkdirSync(path.dirname(configPath));
-    if (content !== null) fs.writeFileSync(configPath, content);
-    const handlers = new Map();
-    const state = { cron: '', mounted: new Set(), calls: [], failures: {} };
-    const mountDir = name => path.join(dir, 'runtime', 'rclone-mounts', name);
-    const execFile = (file, args, options, callback) => {
-        if (typeof options === 'function') callback = options;
-        state.calls.push([file, ...args]);
-        let stdout = '';
-        let stderr = '';
-        let error = null;
-        const fail = state.failures[file === 'crontab' ? (args[0] === '-l' ? 'cronRead' : 'cronWrite') : file];
-        if (fail) {
-            error = Object.assign(new Error(fail.message || 'mock command failure'), { code: fail.code || 1 });
-            stderr = fail.stderr || '';
-        } else if (file === 'crontab') {
-            if (args[0] === '-l') stdout = state.cron;
-            else state.cron = fs.readFileSync(args[0], 'utf8');
-        } else if (file === 'mountpoint') {
-            if (!state.mounted.has(args[1])) error = Object.assign(new Error('not a mountpoint'), { code: 32 });
-        } else if (file === 'fusermount' || file === 'umount') {
-            if (!state.keepMounted) state.mounted.delete(args[args.length - 1]);
-        } else if (file === 'rclone' && args[0] === 'obscure') {
-            stdout = `obscured:${args[1]}\n`;
-        } else {
-            throw new Error(`Unexpected external command: ${file} ${args.join(' ')}`);
-        }
-        queueMicrotask(() => callback(error, stdout, stderr));
-    };
-    vm.runInNewContext(source, {
-        require(name) {
-            if (name === 'electron') return {
-                app: { whenReady: () => ({ then() {} }), on() {} },
-                ipcMain: { handle: (name, handler) => handlers.set(name, handler) }
-            };
-            if (name === 'child_process') return { execFile, spawn() { throw new Error('Unexpected spawn'); } };
-            if (name === 'os') return { ...os, homedir: () => dir, tmpdir: () => dir };
-            return appRequire(name);
-        },
-        __dirname: root,
-        process: { ...process, env: { ...process.env, XDG_RUNTIME_DIR: path.join(dir, 'runtime') } },
-        console, setInterval, clearInterval
-    }, { filename: path.join(root, 'main.js') });
-    return {
-        state, configPath, mountDir,
-        readConfig: () => fs.readFileSync(configPath, 'utf8'),
-        invoke: (name, options = {}) => handlers.get(name)(null, { configPathOpt: configPath, ...options }),
-        mount(name) {
-            fs.mkdirSync(mountDir(name), { recursive: true });
-            state.mounted.add(mountDir(name));
-        }
-    };
-}
+const { createApp } = require('./helpers/app-harness.cjs');
 
 const fooCron = "@reboot rclone mount 'foo:' '/managed/foo' --daemon # Added by de_rclone: foo\n";
 const unrelatedCron = '# keep this comment about rclone mount foo:\n' +
@@ -74,228 +15,573 @@ const unrelatedCron = '# keep this comment about rclone mount foo:\n' +
     '@reboot rclone mount foo:subdir /managed/subdir --daemon\n' +
     '0 1 * * * echo backup # rclone mount foo:\n' +
     '0 2 * * * echo rclone mount foo:\n';
+const ENCRYPTED = '# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n';
+const sftp = (name) => ({ pluginName: 'sftp', config: { remote_name: name, host: 'host.example', user: 'alice' } });
+
+// --- #3 mount state ---------------------------------------------------------
+
+test('a dead mount is Stale and never stops the other remotes from loading', async t => {
+    const app = createApp(t);
+    app.mount('foo', { stale: true });
+    app.mount('prefixfoo');
+    const remotes = await app.invoke('get_remotes');
+    const by = Object.fromEntries(remotes.map(r => [r.name, r]));
+    assert.equal(by.foo.mount_state, 'stale');
+    assert.equal(by.foo.mounted, 'Stale');
+    assert.equal(by.prefixfoo.mount_state, 'mounted');
+    assert.equal(by.prefixfoo.mounted, 'Yes');
+});
+
+test('an unreadable mount table degrades every remote to Unknown instead of failing the list', async t => {
+    const app = createApp(t);
+    app.state.cron = unrelatedCron + fooCron;
+    app.state.mountinfoError = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    const remotes = await app.invoke('get_remotes');
+    assert.equal(remotes.length, 2);
+    for (const remote of remotes) {
+        assert.equal(remote.mount_state, 'unknown');
+        assert.match(remote.mount_note, /mount table/);
+    }
+    assert.equal(remotes.find(r => r.name === 'foo').cron, 'Yes', 'cron column is independent of the mount table');
+});
+
+test('a foreign mount at a managed path is shown as such and never touched', async t => {
+    const app = createApp(t);
+    fs.mkdirSync(app.mountDir('foo'), { recursive: true });
+    app.state.foreignMounts.push({ mountPoint: app.mountDir('foo'), fsType: 'fuse.sshfs', source: 'me@host:/data' });
+    app.state.cron = fooCron;
+    const before = app.readConfig();
+
+    assert.equal((await app.invoke('get_remotes')).find(r => r.name === 'foo').mount_state, 'foreign');
+    for (const [handler, args] of [['mount_remote', {}], ['unmount_remote', {}], ['recover_mount', {}], ['delete_remote', {}]]) {
+        const result = await app.invoke(handler, { remoteName: 'foo', ...args });
+        assert.equal(result.success, false, handler);
+        assert.equal(result.code, 'MOUNT_FOREIGN', handler);
+        assert.match(result.message, /fuse\.sshfs/, handler);
+    }
+    for (const tool of ['fusermount', 'fusermount3', 'umount', 'rclone']) {
+        assert.equal(app.calls(tool).length, 0, `${tool} must not run for a foreign mount`);
+    }
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, fooCron);
+    assert.equal(app.state.foreignMounts.length, 1);
+});
+
+test('a stale mount refuses mount, unmount and delete, and Recover releases it', async t => {
+    const app = createApp(t);
+    app.mount('foo', { stale: true });
+    app.state.cron = fooCron;
+    const before = app.readConfig();
+
+    for (const handler of ['mount_remote', 'unmount_remote', 'delete_remote']) {
+        const result = await app.invoke(handler, { remoteName: 'foo' });
+        assert.equal(result.success, false, handler);
+        assert.equal(result.code, 'MOUNT_STALE', handler);
+        assert.match(result.message, /Recover/, handler);
+    }
+    assert.equal(app.calls('rclone').length, 0, 'no rclone mount for a stale mount');
+    assert.equal(app.calls('fusermount').length + app.calls('umount').length, 0);
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, fooCron);
+
+    const recovered = await app.invoke('recover_mount', { remoteName: 'foo' });
+    assert.equal(recovered.success, true, recovered.message);
+    assert.equal(app.state.mounts.size, 0);
+    assert.equal(fs.existsSync(app.mountDir('foo')), false);
+    assert.equal(app.readConfig(), before, 'recovery never edits the config');
+});
+
+test('recover uses a lazy unmount only for a stale mount', async t => {
+    const app = createApp(t);
+    app.state.requireLazy = true;
+    app.mount('foo', { stale: true });
+    assert.equal((await app.invoke('recover_mount', { remoteName: 'foo' })).success, true);
+    assert.ok(app.calls('fusermount').some(call => call.includes('-uz')));
+
+    const healthy = createApp(t);
+    healthy.state.requireLazy = true;
+    healthy.mount('foo');
+    const result = await healthy.invoke('unmount_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'MOUNT_BUSY');
+    assert.equal(healthy.calls('fusermount').some(call => call.includes('-uz')), false, 'a healthy mount is never lazily unmounted');
+    assert.equal(healthy.state.mounts.has('foo'), true);
+});
+
+test('recover refuses a healthy or absent mount', async t => {
+    const app = createApp(t);
+    app.mount('foo');
+    for (const name of ['foo', 'prefixfoo']) {
+        const result = await app.invoke('recover_mount', { remoteName: name });
+        assert.equal(result.success, false);
+        assert.equal(result.code, 'MOUNT_NOT_STALE');
+    }
+    assert.equal(app.calls('fusermount').length + app.calls('umount').length, 0);
+    assert.equal(app.state.mounts.has('foo'), true);
+});
+
+test('mount starts rclone with the managed path and reports the mount only once it is visible', async t => {
+    const app = createApp(t);
+    const result = await app.invoke('mount_remote', { remoteName: 'foo' });
+    assert.equal(result.success, true, result.message);
+    const [, ...args] = app.calls('rclone')[0];
+    assert.deepEqual(args.slice(0, 5), ['mount', 'foo:', app.mountDir('foo'), '--vfs-cache-mode', 'writes']);
+    assert.ok(args.includes('--daemon'));
+    assert.equal((await app.invoke('get_remotes')).find(r => r.name === 'foo').mount_state, 'mounted');
+    assert.equal((await app.invoke('mount_remote', { remoteName: 'foo' })).success, true, 'already mounted is success');
+    assert.equal(app.calls('rclone').length, 1, 'no second rclone for an existing mount');
+});
+
+test('a failed mount reports rclone\'s reason and removes the directory it created', async t => {
+    const app = createApp(t);
+    app.state.mountBehavior = 'fail';
+    const result = await app.invoke('mount_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'MOUNT_FAILED');
+    assert.match(result.message, /boom/);
+    assert.equal(fs.existsSync(app.mountDir('foo')), false);
+});
+
+test('rclone exiting 0 without a visible mount is a failure, not a success', async t => {
+    const app = createApp(t);
+    app.state.mountBehavior = 'invisible';
+    const result = await app.invoke('mount_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'MOUNT_NOT_VISIBLE');
+    assert.equal(fs.existsSync(app.mountDir('foo')), false);
+});
+
+test('mount state does not depend on the mountpoint tool at all', async t => {
+    const app = createApp(t);
+    app.mount('foo');
+    await app.invoke('get_remotes');
+    await app.invoke('unmount_remote', { remoteName: 'foo' });
+    assert.equal(app.calls('mountpoint').length, 0);
+});
+
+// --- deletion ---------------------------------------------------------------
 
 test('deletion unmounts only the target, removes its cron and directory, and preserves other config', async t => {
-    const f = fixture(t);
-    f.mount('foo');
-    f.mount('prefixfoo');
-    f.state.cron = unrelatedCron + fooCron;
-    const result = await f.invoke('delete_remote', { remoteName: 'foo' });
+    const app = createApp(t);
+    app.mount('foo');
+    app.mount('prefixfoo');
+    app.state.cron = unrelatedCron + fooCron;
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
     assert.equal(result.success, true, result.message);
-    assert.equal(f.state.mounted.has(f.mountDir('foo')), false);
-    assert.equal(f.state.mounted.has(f.mountDir('prefixfoo')), true);
-    assert.equal(fs.existsSync(f.mountDir('foo')), false);
-    assert.equal(f.state.cron, unrelatedCron);
-    assert.equal(f.readConfig(), '[prefixfoo]\ntype = sftp\npass = keep-secret\n');
+    assert.equal(app.state.mounts.has('foo'), false);
+    assert.equal(app.state.mounts.has('prefixfoo'), true);
+    assert.equal(fs.existsSync(app.mountDir('foo')), false);
+    assert.equal(app.state.cron, unrelatedCron);
+    assert.equal(app.readConfig(), '[prefixfoo]\ntype = sftp\npass = keep-secret\n');
 });
 
-test('delete keeps credentials and cron when both unmount commands fail', async t => {
-    const f = fixture(t);
-    const before = f.readConfig();
-    f.mount('foo');
-    f.state.cron = fooCron;
-    f.state.failures.fusermount = { stderr: 'device busy' };
-    f.state.failures.umount = { stderr: 'target is busy' };
-    const result = await f.invoke('delete_remote', { remoteName: 'foo' });
+test('delete keeps config, cron and mount when every unmount tool fails', async t => {
+    const app = createApp(t);
+    const before = app.readConfig();
+    app.mount('foo');
+    app.state.cron = fooCron;
+    app.state.toolFailures.fusermount = 'fusermount: failed to unmount: Device or resource busy';
+    app.state.toolFailures.umount = 'umount: target is busy';
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
     assert.equal(result.success, false);
-    assert.match(result.message, /unmount|busy/i);
-    assert.equal(f.readConfig(), before);
-    assert.equal(f.state.cron, fooCron);
-    assert.equal(f.state.mounted.has(f.mountDir('foo')), true);
+    assert.equal(result.code, 'MOUNT_BUSY');
+    assert.match(result.message, /busy/i);
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, fooCron);
+    assert.equal(app.state.mounts.has('foo'), true);
 });
 
-for (const failure of ['cronRead', 'cronWrite']) {
-    test(`delete preserves config on ${failure} failure`, async t => {
-        const f = fixture(t);
-        const before = f.readConfig();
-        f.state.cron = unrelatedCron + fooCron;
-        f.state.failures[failure] = { stderr: 'permission denied reading/writing crontab' };
-        const result = await f.invoke('delete_remote', { remoteName: 'foo' });
-        assert.equal(result.success, false);
-        assert.match(result.message, /crontab|cron/i);
-        assert.match(result.message, /permission denied/);
-        assert.equal(f.readConfig(), before);
-        assert.equal(f.state.cron, unrelatedCron + fooCron);
-    });
-}
-
-test('delete fails safely when mount status cannot be established', async t => {
-    const f = fixture(t);
-    f.mount('foo');
-    const before = f.readConfig();
-    f.state.failures.mountpoint = { code: 'ENOENT', message: 'mountpoint not installed' };
-    const result = await f.invoke('delete_remote', { remoteName: 'foo' });
+test('a crontab that cannot be read is detected before anything is unmounted', async t => {
+    const app = createApp(t);
+    const before = app.readConfig();
+    app.mount('foo');
+    app.state.cron = fooCron;
+    app.state.cronMode = 'error';
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
     assert.equal(result.success, false);
-    assert.match(result.message, /mountpoint|mount point/i);
-    assert.equal(f.readConfig(), before);
+    assert.equal(result.code, 'CRON_ERROR');
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.mounts.has('foo'), true, 'pre-flight failure must not disturb the mount');
+    assert.equal(app.calls('fusermount').length + app.calls('umount').length, 0);
+});
+
+test('a crontab write failure keeps the config for retry', async t => {
+    const app = createApp(t);
+    const before = app.readConfig();
+    app.mount('foo');
+    app.state.cron = unrelatedCron + fooCron;
+    app.state.cronWriteError = 'crontab: installing new crontab failed';
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'CRON_WRITE_FAILED');
+    assert.match(result.message, /installing new crontab failed/);
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, unrelatedCron + fooCron);
+});
+
+test('a successful unmount command must actually release the mount before deletion', async t => {
+    const app = createApp(t);
+    app.mount('foo');
+    app.state.keepMountedAfterUnmount = true;
+    app.state.cron = fooCron;
+    const before = app.readConfig();
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.match(result.message, /did not release/);
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, fooCron);
+    assert.equal(fs.existsSync(app.mountDir('foo')), true);
 });
 
 test('delete preserves a nonempty managed directory and credentials for manual cleanup', async t => {
-    const f = fixture(t);
-    fs.mkdirSync(f.mountDir('foo'), { recursive: true });
-    fs.writeFileSync(path.join(f.mountDir('foo'), 'keep'), 'local data');
-    const before = f.readConfig();
-    const result = await f.invoke('delete_remote', { remoteName: 'foo' });
+    const app = createApp(t);
+    fs.mkdirSync(app.mountDir('foo'), { recursive: true });
+    fs.writeFileSync(path.join(app.mountDir('foo'), 'keep'), 'local data');
+    const before = app.readConfig();
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
     assert.equal(result.success, false);
-    assert.match(result.message, /directory|ENOTEMPTY|not empty/i);
-    assert.equal(f.readConfig(), before);
-    assert.equal(fs.readFileSync(path.join(f.mountDir('foo'), 'keep'), 'utf8'), 'local data');
+    assert.match(result.message, /directory/i);
+    assert.equal(app.readConfig(), before);
+    assert.equal(fs.readFileSync(path.join(app.mountDir('foo'), 'keep'), 'utf8'), 'local data');
 });
 
-test('unmount handler uses the same cleanup and falls back to umount', async t => {
-    const f = fixture(t);
-    f.mount('foo');
-    f.state.failures.fusermount = { stderr: 'fusermount unavailable' };
-    const result = await f.invoke('unmount_remote', { remoteName: 'foo' });
+test('unmount falls back to the next available tool', async t => {
+    const app = createApp(t);
+    app.state.missingTools.add('fusermount');
+    app.mount('foo');
+    const result = await app.invoke('unmount_remote', { remoteName: 'foo' });
     assert.equal(result.success, true, result.message);
-    assert.equal(f.state.mounted.size, 0);
-    assert.equal(fs.existsSync(f.mountDir('foo')), false);
+    assert.equal(app.calls('umount').length, 1);
+    assert.equal(app.state.mounts.size, 0);
+});
+
+test('unmount with no usable tool says so instead of pretending', async t => {
+    const app = createApp(t);
+    for (const tool of ['fusermount', 'umount']) app.state.missingTools.add(tool);
+    app.mount('foo');
+    const result = await app.invoke('unmount_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'MOUNT_TOOL_MISSING');
+    assert.equal(app.state.mounts.has('foo'), true);
 });
 
 test('config create, update and delete force mode 0600 with permissive umask', async t => {
-    const f = fixture(t, null);
+    const app = createApp(t, { config: null });
     const oldUmask = process.umask(0);
     t.after(() => process.umask(oldUmask));
-    const mode = () => fs.statSync(f.configPath).mode & 0o777;
+    const mode = () => fs.statSync(app.configPath).mode & 0o777;
     const config = { remote_name: 'foo', host: 'host.example', user: 'alice', pass: 'secret' };
-    assert.equal((await f.invoke('add_remote_with_plugin', { pluginName: 'sftp', config })).success, true);
+    assert.equal((await app.invoke('add_remote_with_plugin', { pluginName: 'sftp', config })).success, true);
     assert.equal(mode(), 0o600);
-    fs.chmodSync(f.configPath, 0o666);
-    assert.equal((await f.invoke('add_remote_with_plugin', {
-        pluginName: 'sftp', config: { ...config, remote_name: 'second' }
-    })).success, true);
+    assert.match(app.readConfig(), /pass = obscured:secret/);
+    fs.chmodSync(app.configPath, 0o666);
+    assert.equal((await app.invoke('add_remote_with_plugin', { pluginName: 'sftp', config: { ...config, remote_name: 'second' } })).success, true);
     assert.equal(mode(), 0o600);
-    fs.chmodSync(f.configPath, 0o666);
-    assert.equal((await f.invoke('update_remote_with_plugin', {
-        remoteName: 'foo', pluginName: 'sftp', config: { host: 'new.example' }
-    })).success, true);
+    fs.chmodSync(app.configPath, 0o666);
+    assert.equal((await app.invoke('update_remote_with_plugin', { remoteName: 'foo', pluginName: 'sftp', config: { host: 'new.example' } })).success, true);
     assert.equal(mode(), 0o600);
-    fs.chmodSync(f.configPath, 0o666);
-    assert.equal((await f.invoke('delete_remote', { remoteName: 'foo' })).success, true);
+    fs.chmodSync(app.configPath, 0o666);
+    assert.equal((await app.invoke('delete_remote', { remoteName: 'foo' })).success, true);
     assert.equal(mode(), 0o600);
-});
-
-test('cron status, add and remove use exact remote arguments and preserve unrelated bytes', async t => {
-    const f = fixture(t);
-    f.state.cron = unrelatedCron;
-    const remotes = await f.invoke('get_remotes');
-    assert.equal(remotes.find(remote => remote.name === 'foo').cron, 'No');
-    assert.equal(remotes.find(remote => remote.name === 'prefixfoo').cron, 'Yes');
-    assert.equal((await f.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron.startsWith(unrelatedCron), true);
-    const withFoo = f.state.cron;
-    assert.equal((await f.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron, withFoo);
-    assert.equal((await f.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron, unrelatedCron);
 });
 
 for (const name of ['name with spaces', "team's remote"]) {
-    test(`existing remote ${JSON.stringify(name)} supports exact quoted cron and deletion`, async t => {
-        const f = fixture(t, `[${name}]\ntype = sftp\npass = secret\n`);
-        f.mount(name);
-        f.state.cron = unrelatedCron;
-        assert.equal((await f.invoke('add_to_cron', { remoteName: name })).success, true);
-        assert.equal((await f.invoke('get_remotes'))[0].cron, 'Yes');
-        assert.equal((await f.invoke('delete_remote', { remoteName: name })).success, true);
-        assert.equal(f.state.cron, unrelatedCron);
-        assert.equal(f.readConfig(), '');
-        assert.equal(fs.existsSync(f.mountDir(name)), false);
+    test(`existing remote ${JSON.stringify(name)} supports exact quoted cron, mount state and deletion`, async t => {
+        const app = createApp(t, { config: `[${name}]\ntype = sftp\npass = secret\n` });
+        app.mount(name);
+        app.state.cron = unrelatedCron;
+        assert.equal((await app.invoke('get_remotes'))[0].mount_state, 'mounted', 'escaped mountinfo path round-trips');
+        assert.equal((await app.invoke('add_to_cron', { remoteName: name })).success, true);
+        assert.equal((await app.invoke('get_remotes'))[0].cron, 'Yes');
+        const result = await app.invoke('delete_remote', { remoteName: name });
+        assert.equal(result.success, true, result.message);
+        assert.equal(app.state.cron, unrelatedCron);
+        assert.equal(app.readConfig(), '');
+        assert.equal(fs.existsSync(app.mountDir(name)), false);
     });
 }
 
 for (const name of ['../escape', '..', '.', '/absolute', 'nested/name', 'nested\\name']) {
     test(`managed mount paths reject ${JSON.stringify(name)} without deleting credentials`, async t => {
-        const f = fixture(t, `[${name}]\ntype = sftp\npass = secret\n`);
-        const before = f.readConfig();
-        const result = await f.invoke('delete_remote', { remoteName: name });
+        const app = createApp(t, { config: `[${name}]\ntype = sftp\npass = secret\n` });
+        const before = app.readConfig();
+        const result = await app.invoke('delete_remote', { remoteName: name });
         assert.equal(result.success, false);
         assert.match(result.message, /remote name|mount path/i);
-        assert.equal(f.readConfig(), before);
-        assert.equal(f.state.calls.length, 0);
+        assert.equal(app.readConfig(), before);
+        assert.equal(app.state.calls.length, 0);
+        const listed = await app.invoke('get_remotes');
+        assert.equal(listed.length, 1, 'one unusable name must not fail the whole list');
+        assert.equal(listed[0].mount_state, 'unknown');
     });
 }
 
-test('actual no-crontab result permits first add and deletion without a cron write', async t => {
-    const f = fixture(t);
-    f.state.failures.cronRead = { code: 1, stderr: 'no crontab for test-user\n' };
-    assert.equal((await f.invoke('get_remotes'))[0].cron, 'No');
-    assert.equal((await f.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
-    delete f.state.failures.cronRead;
-    assert.equal((await f.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
-    f.state.failures.cronRead = { code: 1, stderr: 'no crontab for test-user\n' };
-    const writes = f.state.calls.filter(call => call[0] === 'crontab' && call[1] !== '-l').length;
-    assert.equal((await f.invoke('delete_remote', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.calls.filter(call => call[0] === 'crontab' && call[1] !== '-l').length, writes);
+// --- #4 crontab -------------------------------------------------------------
+
+test('cron status, add and remove use exact remote arguments and preserve unrelated bytes', async t => {
+    const app = createApp(t);
+    app.state.cron = unrelatedCron;
+    const remotes = await app.invoke('get_remotes');
+    assert.equal(remotes.find(r => r.name === 'foo').cron, 'No');
+    assert.equal(remotes.find(r => r.name === 'prefixfoo').cron, 'Yes');
+    assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
+    assert.equal(app.state.cron.startsWith(unrelatedCron), true);
+    const withFoo = app.state.cron;
+    assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
+    assert.equal(app.state.cron, withFoo);
+    assert.equal((await app.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
+    assert.equal(app.state.cron, unrelatedCron);
 });
 
-for (const failure of [
-    { code: 1, stderr: 'crontab: permission denied' }
-]) {
-    test(`crontab read error ${failure.code} is never treated as an empty table`, async t => {
-        const f = fixture(t);
-        const before = f.readConfig();
-        f.state.cron = unrelatedCron;
-        f.state.failures.cronRead = failure;
-        await assert.rejects(f.invoke('get_remotes'), /crontab/i);
-        for (const handler of ['add_to_cron', 'remove_from_cron', 'delete_remote']) {
-            const result = await f.invoke(handler, { remoteName: 'foo' });
-            assert.equal(result.success, false, handler);
-            assert.match(result.message, /crontab/i);
-        }
-        assert.equal(f.readConfig(), before);
-        assert.equal(f.state.cron, unrelatedCron);
-        assert.equal(f.state.calls.some(call => call[0] === 'crontab' && call[1] !== '-l'), false);
+test('a crontab that exits 0 without installing the change is reported, not trusted', async t => {
+    const app = createApp(t);
+    app.state.cronIgnoresWrites = true;
+    const enabled = await app.invoke('add_to_cron', { remoteName: 'foo' });
+    assert.equal(enabled.success, false);
+    assert.equal(enabled.code, 'CRON_VERIFY_FAILED');
+
+    app.state.cronIgnoresWrites = false;
+    app.state.cron = fooCron;
+    app.state.cronIgnoresWrites = true;
+    const disabled = await app.invoke('remove_from_cron', { remoteName: 'foo' });
+    assert.equal(disabled.success, false);
+    assert.equal(disabled.code, 'CRON_VERIFY_FAILED');
+
+    app.mount('foo');
+    const deleted = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(deleted.success, false, 'deletion must not claim the cron entry is gone');
+    assert.equal(deleted.code, 'CRON_VERIFY_FAILED');
+    assert.match(app.readConfig(), /\[foo\]/, 'config kept for retry');
+});
+
+test('crontab is only ever read with -l and written through stdin, never through a file', async t => {
+    const app = createApp(t);
+    await app.invoke('get_remotes');
+    assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
+    assert.equal((await app.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
+    assert.ok(app.cronWrites().length >= 2);
+    for (const [, ...args] of app.calls('crontab')) assert.ok(args.length === 1 && (args[0] === '-l' || args[0] === '-'), `unexpected crontab args ${args}`);
+    assert.deepEqual(fs.readdirSync(app.dir).sort(), ['config', 'runtime'], 'no temp files left in the temp dir');
+});
+
+test('a denied crontab degrades the Cron column and nothing else', async t => {
+    const app = createApp(t);
+    app.state.cronMode = 'denied';
+    app.mount('foo');
+    const remotes = await app.invoke('get_remotes');
+    assert.equal(remotes.length, 2);
+    for (const remote of remotes) {
+        assert.equal(remote.cron, 'Unknown');
+        assert.match(remote.cron_note, /denied/);
+    }
+    assert.equal(remotes.find(r => r.name === 'foo').mount_state, 'mounted');
+});
+
+for (const [mode, expectedNote] of [['missing', /not installed/], ['error', /temporary failure/]]) {
+    test(`crontab ${mode}: the list still loads with Cron Unknown`, async t => {
+        const app = createApp(t);
+        app.state.cronMode = mode;
+        const remotes = await app.invoke('get_remotes');
+        assert.equal(remotes.length, 2);
+        assert.equal(remotes[0].cron, 'Unknown');
+        assert.match(remotes[0].cron_note, expectedNote);
     });
 }
 
-test('missing optional crontab permits deletion with an explicit manual-cleanup warning', async t => {
-    const f = fixture(t);
-    f.mount('foo');
-    f.state.cron = unrelatedCron + fooCron;
-    f.state.failures.cronRead = { code: 'ENOENT', message: 'spawn crontab ENOENT' };
-    assert.equal((await f.invoke('get_remotes'))[0].cron, 'No');
-    const add = await f.invoke('add_to_cron', { remoteName: 'foo' });
-    assert.equal(add.success, false);
-    assert.match(add.message, /install.*crontab|crontab.*install/i);
-    const remove = await f.invoke('remove_from_cron', { remoteName: 'foo' });
-    assert.equal(remove.success, true);
-    assert.match(remove.message, /unavailable.*manually/);
-    const deletion = await f.invoke('delete_remote', { remoteName: 'foo' });
-    assert.equal(deletion.success, true, deletion.message);
-    assert.match(deletion.message, /unavailable.*manually/);
-    assert.equal(fs.existsSync(f.mountDir('foo')), false);
-    assert.equal(f.state.cron, unrelatedCron + fooCron);
-    assert.equal(f.state.calls.some(call => call[0] === 'crontab' && call[1] !== '-l'), false);
+test('having no crontab at all is an empty table, not an error', async t => {
+    const app = createApp(t);
+    app.state.cron = null;
+    assert.equal((await app.invoke('get_remotes'))[0].cron, 'No');
+    assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
+    assert.match(app.state.cron, /rclone mount 'foo:'/);
 });
 
-test('cron matching accepts absolute rclone commands and double-quoted remote names', async t => {
-    const f = fixture(t);
-    f.state.cron = unrelatedCron + '@reboot /usr/bin/rclone mount "foo:" /managed/foo --daemon\n';
-    assert.equal((await f.invoke('get_remotes'))[0].cron, 'Yes');
-    assert.equal((await f.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron, unrelatedCron);
-});
-
-test('cron add preserves extra blank lines and comments in the existing table', async t => {
-    const f = fixture(t);
-    f.state.cron = unrelatedCron + '\n\n';
-    assert.equal((await f.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron.startsWith(unrelatedCron + '\n\n'), true);
-    assert.equal((await f.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
-    assert.equal(f.state.cron, unrelatedCron + '\n\n');
-});
-
-test('a successful unmount command must actually release the mount before deletion', async t => {
-    const f = fixture(t);
-    f.mount('foo');
-    f.state.keepMounted = true;
-    f.state.cron = fooCron;
-    const before = f.readConfig();
-    const result = await f.invoke('delete_remote', { remoteName: 'foo' });
+test('enabling auto-mount without crontab access fails clearly and writes nothing', async t => {
+    const app = createApp(t);
+    app.state.cronMode = 'denied';
+    const result = await app.invoke('add_to_cron', { remoteName: 'foo' });
     assert.equal(result.success, false);
-    assert.match(result.message, /did not release/);
-    assert.equal(f.readConfig(), before);
-    assert.equal(f.state.cron, fooCron);
-    assert.equal(fs.existsSync(f.mountDir('foo')), true);
+    assert.equal(result.code, 'CRON_UNAVAILABLE');
+    assert.match(result.message, /cron\.allow/);
+    assert.equal(app.cronWrites().length, 0);
+});
+
+test('an unexpected crontab error never turns into a write', async t => {
+    const app = createApp(t);
+    app.state.cron = unrelatedCron;
+    app.state.cronMode = 'error';
+    for (const handler of ['add_to_cron', 'remove_from_cron']) {
+        const result = await app.invoke(handler, { remoteName: 'foo' });
+        assert.equal(result.success, false, handler);
+        assert.equal(result.code, 'CRON_ERROR', handler);
+    }
+    assert.equal(app.cronWrites().length, 0);
+    assert.equal(app.state.cron, unrelatedCron);
+});
+
+test('disabling auto-mount without crontab access warns instead of claiming success', async t => {
+    const app = createApp(t);
+    app.state.cronMode = 'denied';
+    const result = await app.invoke('remove_from_cron', { remoteName: 'foo' });
+    assert.equal(result.success, true);
+    assert.equal(result.warning, true);
+    assert.match(result.message, /unavailable.*manually/);
+    assert.doesNotMatch(result.message, /^Disabled/);
+});
+
+for (const mode of ['denied', 'missing']) {
+    test(`delete works with crontab ${mode} and warns that cron entries need manual cleanup`, async t => {
+        const app = createApp(t);
+        app.mount('foo');
+        app.state.cronMode = mode;
+        const result = await app.invoke('delete_remote', { remoteName: 'foo' });
+        assert.equal(result.success, true, result.message);
+        assert.match(result.message, /unavailable.*manually/);
+        assert.equal(app.state.mounts.size, 0);
+        assert.equal(app.readConfig(), '[prefixfoo]\ntype = sftp\npass = keep-secret\n');
+        assert.equal(app.cronWrites().length, 0);
+    });
+}
+
+// --- #4 rollback of a remote created moments ago ----------------------------
+
+for (const mode of ['ok', 'denied', 'error', 'missing']) {
+    test(`rollback removes a just-created remote with crontab ${mode} and never touches cron`, async t => {
+        const app = createApp(t);
+        app.state.cronMode = mode;
+        assert.equal((await app.invoke('add_remote_with_plugin', sftp('newone'))).success, true);
+        assert.match(app.readConfig(), /\[newone\]/);
+        const result = await app.invoke('delete_remote', { remoteName: 'newone', rollback: true });
+        assert.equal(result.success, true, result.message);
+        assert.doesNotMatch(app.readConfig(), /newone/);
+        assert.match(app.readConfig(), /\[foo\]/);
+        assert.equal(app.calls('crontab').length, 0);
+    });
+}
+
+test('rollback is refused for a remote this session did not create', async t => {
+    const app = createApp(t);
+    const before = app.readConfig();
+    const result = await app.invoke('delete_remote', { remoteName: 'foo', rollback: true });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'ROLLBACK_NOT_ALLOWED');
+    assert.equal(app.readConfig(), before);
+});
+
+test('rollback is refused when the new remote has been mounted, and the name is forgotten after deletion', async t => {
+    const app = createApp(t);
+    await app.invoke('add_remote_with_plugin', sftp('newone'));
+    app.mount('newone');
+    const refused = await app.invoke('delete_remote', { remoteName: 'newone', rollback: true });
+    assert.equal(refused.success, false);
+    assert.equal(refused.code, 'ROLLBACK_NOT_ALLOWED');
+    assert.match(app.readConfig(), /\[newone\]/);
+    assert.equal(app.state.mounts.has('newone'), true);
+
+    app.state.mounts.delete('newone');
+    assert.equal((await app.invoke('delete_remote', { remoteName: 'newone', rollback: true })).success, true);
+    // Re-created by hand outside the app: rollback must no longer apply.
+    fs.appendFileSync(app.configPath, '\n[newone]\ntype = sftp\n');
+    assert.equal((await app.invoke('delete_remote', { remoteName: 'newone', rollback: true })).code, 'ROLLBACK_NOT_ALLOWED');
+});
+
+// --- legacy ~/mnt cleanup ---------------------------------------------------
+
+test('legacy mounts list only rclone mounts, even when crontab is denied', async t => {
+    const app = createApp(t);
+    const legacy = path.join(app.dir, 'mnt');
+    fs.mkdirSync(legacy);
+    app.state.foreignMounts.push(
+        { mountPoint: path.join(legacy, 'old remote'), fsType: 'fuse.rclone', source: 'old remote:' },
+        { mountPoint: path.join(legacy, 'nas'), fsType: 'fuse.sshfs', source: 'me@nas:/share' },
+        { mountPoint: path.join(legacy, 'vault'), fsType: 'ext4', source: '/dev/mapper/vault' }
+    );
+    app.state.cronMode = 'denied';
+    const state = await app.invoke('check_legacy_state');
+    assert.deepEqual([...state.mounts], [path.join(legacy, 'old remote')]);
+    assert.match(state.cronNote, /denied/);
+    assert.deepEqual([...state.legacyCrons], []);
+});
+
+test('legacy unmount refuses anything the mount table does not list as a legacy rclone mount', async t => {
+    const app = createApp(t);
+    const legacy = path.join(app.dir, 'mnt');
+    fs.mkdirSync(legacy);
+    const rcloneMount = path.join(legacy, 'old');
+    const sshfsMount = path.join(legacy, 'nas');
+    app.state.foreignMounts.push(
+        { mountPoint: rcloneMount, fsType: 'fuse.rclone', source: 'old:' },
+        { mountPoint: sshfsMount, fsType: 'fuse.sshfs', source: 'me@nas:/share' }
+    );
+    const result = await app.invokeRaw('unmount_legacy_mounts', [sshfsMount, '/etc', path.join(legacy, '..', 'x')]);
+    assert.equal(result.success, false);
+    assert.equal(result.count, 0);
+    assert.equal(app.calls('fusermount').length + app.calls('umount').length, 0);
+    assert.equal(app.state.foreignMounts.length, 2);
+
+    assert.equal((await app.invokeRaw('unmount_legacy_mounts', { 0: rcloneMount })).success, false, 'non-list input fails closed');
+    const ok = await app.invokeRaw('unmount_legacy_mounts', [rcloneMount]);
+    assert.deepEqual([ok.success, ok.count], [true, 1]);
+    assert.deepEqual(app.state.foreignMounts.map(m => m.mountPoint), [sshfsMount]);
+});
+
+test('removing legacy cron entries without crontab access is a warning, not a crash', async t => {
+    const app = createApp(t);
+    app.state.cronMode = 'denied';
+    const result = await app.invoke('remove_legacy_crons');
+    assert.equal(result.success, true);
+    assert.equal(result.count, 0);
+    assert.match(result.warning, /unavailable/);
+});
+
+// --- #5 encrypted config and validated writes -------------------------------
+
+test('an encrypted config is explained, never listed as empty, and never modified', async t => {
+    const app = createApp(t, { config: ENCRYPTED });
+    await assert.rejects(app.invoke('get_remotes'), /CONFIG_ENCRYPTED.*encrypted/);
+    await assert.rejects(app.invoke('add_remote_with_plugin', sftp('newone')), /CONFIG_ENCRYPTED/);
+    await assert.rejects(app.invoke('update_remote_with_plugin', { remoteName: 'foo', pluginName: 'sftp', config: { host: 'x.example' } }), /CONFIG_ENCRYPTED/);
+    await assert.rejects(app.invoke('get_remote_config', { remoteName: 'foo' }), /CONFIG_ENCRYPTED/);
+    const deleted = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(deleted.success, false);
+    assert.equal(deleted.code, 'CONFIG_ENCRYPTED');
+    assert.equal(app.readConfig(), ENCRYPTED, 'bytes unchanged');
+    assert.equal(app.calls('rclone').length, 0, 'refused before any external command');
+    assert.deepEqual(fs.readdirSync(path.dirname(app.configPath)), ['rclone.conf'], 'no temp files');
+});
+
+test('a config edited by someone else mid-operation is not overwritten', async t => {
+    const app = createApp(t);
+    const intruder = '\n[intruder]\ntype = alias\nremote = /tmp\n';
+    let fired = false;
+    app.state.onDump = () => {
+        if (fired) return;
+        fired = true;
+        fs.appendFileSync(app.configPath, intruder);
+    };
+    const result = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'CONFIG_CHANGED');
+    assert.match(app.readConfig(), /\[foo\]/);
+    assert.match(app.readConfig(), /\[intruder\]/);
+    assert.deepEqual(fs.readdirSync(path.dirname(app.configPath)), ['rclone.conf'], 'no temp files');
+});
+
+test('every config write is validated by rclone before it replaces the file', async t => {
+    const app = createApp(t);
+    assert.equal((await app.invoke('add_remote_with_plugin', sftp('newone'))).success, true);
+    const dumps = app.calls('rclone').filter(call => call.includes('dump'));
+    assert.ok(dumps.length >= 2, 'old and new content are both dumped by rclone');
+    for (const call of dumps) assert.ok(call.includes('--ask-password=false') && call.includes('--config'));
+    assert.deepEqual(fs.readdirSync(path.dirname(app.configPath)), ['rclone.conf']);
+});
+
+// --- harness guard ----------------------------------------------------------
+
+test('the harness refuses writes outside the test directory (protects the real rclone.conf)', async t => {
+    const app = createApp(t, { config: null });
+    const stray = '/tmp/de-rclone-must-never-exist.conf';
+    t.after(() => fs.rmSync(stray, { force: true }));
+    await assert.rejects(app.invoke('add_remote_with_plugin', { ...sftp('x'), configPathOpt: stray }), /TEST ISOLATION/);
+    assert.equal(fs.existsSync(stray), false);
 });

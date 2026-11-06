@@ -39,8 +39,25 @@ A robust, retro-styled GUI manager for **Rclone**, styled with the nostalgic CS 
   are left unchanged. Remote data is not deleted.
 - If unmounting or cron cleanup fails, the remote configuration is kept for
   retry. A failed cron cleanup can leave the remote already unmounted.
-- If `crontab` is not installed, deletion remains available but warns that any
-  existing auto-mount jobs must be removed manually.
+- If `crontab` is unavailable (not installed, or your user is not allowed to use
+  it), listing, mounting and deletion keep working: the Cron column shows
+  **Unknown**, enabling auto-mount reports why it cannot, and deleting a remote
+  warns that any existing auto-mount jobs must be removed manually. Crontab is
+  only ever changed after it was read successfully, and the result is read back
+  to confirm it.
+- Mount state is read from the kernel's mount table, so a crashed rclone does not
+  break the app. A remote can be **Yes**, **No**, **Stale**, **Foreign** or
+  **Unknown**:
+  - **Stale**: the rclone process died and left a dead mount. Select the remote
+    and click **Recover** to release it. Mount and Delete are refused until then.
+  - **Foreign**: something other than rclone is mounted at the remote's managed
+    path. de_rclone never mounts, unmounts or deletes over it.
+  - **Unknown**: the state could not be determined (the reason is shown); only
+    that remote is affected.
+- If your `rclone.conf` is encrypted, de_rclone says so and refuses to change it
+  (it cannot edit encrypted files yet). Every other change is checked with
+  `rclone` itself before the file is replaced atomically, and is abandoned if the
+  file was modified by someone else in the meantime.
 - Configuration files written by the app are restricted to their owner
   (`0600`), including previously shared-readable files.
 
@@ -80,8 +97,7 @@ To take advantage of an update mechanism of Gear Lever and update de_rclone auto
 ## Prerequisites
 *   **Rclone**: You must have `rclone` installed on your system.
 *   **FUSE**: Required for mounting drives (usually pre-installed on most distros).
-*   **mountpoint**: Provided by util-linux; required to verify mount state.
-*   **crontab**: Optional for manual remote management; required for auto-mount.
+*   **crontab**: Optional. Needed only for auto-mount; everything else works without it.
 
 ## Development
 

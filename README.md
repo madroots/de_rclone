@@ -45,6 +45,12 @@ A robust, retro-styled GUI manager for **Rclone**, styled with the nostalgic CS 
   warns that any existing auto-mount jobs must be removed manually. Crontab is
   only ever changed after it was read successfully, and the result is read back
   to confirm it.
+- Auto-mount lines written by de_rclone carry a `# de_rclone:v2` marker. A cron
+  entry you wrote yourself that mounts the same remote is shown as **Manual**:
+  de_rclone never edits it, will not add a second entry next to it, and
+  **Disable auto-mount** leaves it alone. When you delete the remote, such
+  entries are listed with unticked boxes; they are removed only if you tick them,
+  and the result always names the ones that were kept.
 - Mount state is read from the kernel's mount table, so a crashed rclone does not
   break the app. A remote can be **Yes**, **No**, **Stale**, **Foreign** or
   **Unknown**:
@@ -60,6 +66,16 @@ A robust, retro-styled GUI manager for **Rclone**, styled with the nostalgic CS 
   file was modified by someone else in the meantime.
 - Configuration files written by the app are restricted to their owner
   (`0600`), including previously shared-readable files.
+- Only one operation can change a given remote (or the config, or the crontab) at
+  a time. A conflicting request is refused immediately with a message saying what
+  is in progress. Mount and unmount cannot be cancelled once started, so their
+  dialogs show no Cancel button; a connection test can be cancelled and its
+  `rclone` process is stopped. Quitting waits (up to 8 seconds) for work in
+  progress.
+- On first start, leftovers of the old `~/mnt` setup are listed with unticked
+  boxes: only rclone mounts directly under `~/mnt` and legacy cron lines are
+  offered, and only the items you tick are removed. Other mounts (sshfs, NFS,
+  ...) are never listed.
 
 ---
 

@@ -36,10 +36,16 @@ jobs:
       run: |
         npm ci
 
+    # Optional: lets the real-rclone integration tests run. They skip cleanly when
+    # rclone is absent, so a slow or failing package mirror must not block the build.
     - name: Install rclone (config validation integration tests)
+      timeout-minutes: 3
+      continue-on-error: true
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo apt-get update
-        sudo apt-get install -y rclone
+        sudo apt-get update -o Acquire::Retries=2
+        sudo apt-get install -y --no-install-recommends rclone
         rclone version
 
     - name: Check Syntax and Run Regression Tests

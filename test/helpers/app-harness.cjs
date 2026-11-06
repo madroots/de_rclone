@@ -58,6 +58,10 @@ function createApp(t, { config = DEFAULT_CONFIG } = {}) {
         keepMountedAfterUnmount: false,
         mountBehavior: 'success', // success | fail | invisible
         onDump: null,
+        mountGate: null,          // a promise a mount waits on before rclone "exits"
+        lsfBehavior: 'ok',        // ok | fail | hang
+        killed: [],               // signals sent to hung lsf children
+        quitCalls: 0,
         calls: []
     };
     const mountDir = (name) => path.join(runtimeDir, 'rclone-mounts', name);
@@ -179,11 +183,25 @@ function createApp(t, { config = DEFAULT_CONFIG } = {}) {
         } else if (file === 'rclone' && args[0] === 'obscure') {
             done(null, `obscured:${args[1]}\n`);
         } else if (file === 'rclone' && args.includes('config')) {
-            if (state.onDump) state.onDump(args);
-            Promise.resolve(fakeDump(args, options)).then(
-                (r) => callback(null, r.stdout, r.stderr),
-                (e) => callback(e.error || e, e.stdout || '', e.stderr || '')
-            );
+            // onDump may return a promise: tests use it to hold a config write open.
+            Promise.resolve(state.onDump ? state.onDump(args) : undefined)
+                .then(() => fakeDump(args, options))
+                .then(
+                    (r) => callback(null, r.stdout, r.stderr),
+                    (e) => callback(e.error || e, e.stdout || '', e.stderr || '')
+                );
+        } else if (file === 'rclone' && args[0] === 'lsf') {
+            // lsfBehavior: 'ok' | 'fail' | 'hang' (until the child is killed, like a stuck network)
+            if (state.lsfBehavior === 'hang') {
+                child.kill = (signal) => {
+                    state.killed.push(signal);
+                    done(Object.assign(new Error('Command failed'), { killed: true, signal, code: null }));
+                };
+            } else if (state.lsfBehavior === 'fail') {
+                done(Object.assign(new Error('Command failed'), { code: 1 }), '', 'Failed to create file system: nope\n');
+            } else {
+                done(null, 'a/\n', '');
+            }
         } else {
             throw new Error(`Unexpected external command: ${file} ${args.join(' ')}`);
         }
@@ -195,7 +213,11 @@ function createApp(t, { config = DEFAULT_CONFIG } = {}) {
         const child = new EventEmitter();
         child.stderr = Object.assign(new EventEmitter(), { destroy() {} });
         child.unref = () => {};
-        setImmediate(() => {
+        const afterGate = async () => {
+            if (state.mountGate) await state.mountGate; // lets a test hold a mount open
+        };
+        setImmediate(async () => {
+            await afterGate();
             if (state.mountBehavior === 'fail') {
                 child.stderr.emit('data', Buffer.from('Failed to create file system for "x:": boom'));
                 child.emit('exit', 1, null);
@@ -208,10 +230,11 @@ function createApp(t, { config = DEFAULT_CONFIG } = {}) {
     }
 
     const handlers = new Map();
+    const appEvents = new Map();
     vm.runInNewContext(source, {
         require(name) {
             if (name === 'electron') return {
-                app: { whenReady: () => ({ then() {} }), on() {} },
+                app: { whenReady: () => ({ then() {} }), on: (event, fn) => appEvents.set(event, fn), quit() { state.quitCalls++; } },
                 ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) }
             };
             if (name === 'child_process') return { execFile, spawn };
@@ -230,6 +253,7 @@ function createApp(t, { config = DEFAULT_CONFIG } = {}) {
         invoke: (name, options = {}) => handlers.get(name)(null, { configPathOpt: configPath, ...options }),
         // For handlers whose argument is the data itself (not an options object).
         invokeRaw: (name, data) => handlers.get(name)(null, data),
+        appEvents,
         // A healthy rclone mount of `name`, with its managed directory in place.
         mount(name, { stale = false } = {}) {
             fs.mkdirSync(mountDir(name), { recursive: true });

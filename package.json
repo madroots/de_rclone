@@ -3,6 +3,7 @@
   "version": "1.2.9",
   "description": "Rclone GUI Manager",
   "main": "main.js",
+  "desktopName": "de_rclone.desktop",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/madroots/de_rclone.git"
@@ -12,7 +13,10 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "check": "node --check main.js && node --check preload.js && node --check renderer/app.js",
-    "test": "node --test test/*.test.cjs"
+    "test": "node --test test/*.test.cjs",
+    "test:fuse": "DE_RCLONE_REAL_FUSE=1 node --test test/fuse/*.test.cjs",
+    "mutation": "node scripts/mutation-check.cjs",
+    "release:gate": "node scripts/release-gate.cjs"
   },
   "author": "madroots",
   "license": "MIT",
@@ -28,6 +32,7 @@
         "AppImage"
       ],
       "category": "Utility",
+      "syncDesktopName": true,
       "icon": "icon.png"
     },
     "files": [
@@ -48,7 +53,8 @@
       {
         "provider": "github",
         "owner": "madroots",
-        "repo": "de_rclone"
+        "repo": "de_rclone",
+        "releaseType": "draft"
       }
     ]
   }

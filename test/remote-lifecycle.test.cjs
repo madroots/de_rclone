@@ -12,7 +12,7 @@ const { createApp } = require('./helpers/app-harness.cjs');
 const fooCron = "@reboot rclone mount 'foo:' '/managed/foo' --daemon # Added by de_rclone: foo\n";
 const unrelatedCron = '# keep this comment about rclone mount foo:\n' +
     '@reboot rclone mount prefixfoo: /managed/prefixfoo --daemon\n' +
-    '@reboot rclone mount foo:subdir /managed/subdir --daemon\n' +
+    '@reboot rclone mount other: /managed/foo:subdir --daemon\n' +
     '0 1 * * * echo backup # rclone mount foo:\n' +
     '0 2 * * * echo rclone mount foo:\n';
 const ENCRYPTED = '# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n';
@@ -323,7 +323,7 @@ test('cron status, add and remove use exact remote arguments and preserve unrela
     app.state.cron = unrelatedCron;
     const remotes = await app.invoke('get_remotes');
     assert.equal(remotes.find(r => r.name === 'foo').cron, 'No');
-    assert.equal(remotes.find(r => r.name === 'prefixfoo').cron, 'Yes');
+    assert.equal(remotes.find(r => r.name === 'prefixfoo').cron, 'Manual', 'a hand-written entry is reported as manual, not as ours');
     assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
     assert.equal(app.state.cron.startsWith(unrelatedCron), true);
     const withFoo = app.state.cron;
@@ -394,6 +394,100 @@ test('having no crontab at all is an empty table, not an error', async t => {
     assert.equal((await app.invoke('get_remotes'))[0].cron, 'No');
     assert.equal((await app.invoke('add_to_cron', { remoteName: 'foo' })).success, true);
     assert.match(app.state.cron, /rclone mount 'foo:'/);
+});
+
+// --- #7 managed vs manual cron entries ---------------------------------------
+
+const manualFoo = '@reboot nice rclone mount --vfs-cache-mode full foo: /mnt/mine --daemon';
+
+test('a hand-written entry is Manual, is never edited by disable, and blocks a duplicate enable', async t => {
+    const app = createApp(t);
+    app.state.cron = `MAILTO=""\n${manualFoo}\n`;
+    const foo = (await app.invoke('get_remotes')).find(r => r.name === 'foo');
+    assert.deepEqual([foo.cron, foo.cron_state], ['Manual', 'manual']);
+
+    const enable = await app.invoke('add_to_cron', { remoteName: 'foo' });
+    assert.equal(enable.success, false);
+    assert.equal(enable.code, 'CRON_MANUAL_EXISTS');
+    assert.match(enable.message, /written by hand/);
+    assert.equal(app.cronWrites().length, 0);
+
+    const disable = await app.invoke('remove_from_cron', { remoteName: 'foo' });
+    assert.equal(disable.success, true);
+    assert.equal(disable.warning, true);
+    assert.match(disable.message, /left unchanged/);
+    assert.equal(app.state.cron, `MAILTO=""\n${manualFoo}\n`);
+    assert.equal(app.cronWrites().length, 0);
+});
+
+test('disable removes only the managed line even when a hand-written one exists for the same remote', async t => {
+    const app = createApp(t);
+    app.state.cron = `${manualFoo}\n${fooCron}`;
+    assert.equal((await app.invoke('get_remotes')).find(r => r.name === 'foo').cron_state, 'managed');
+    const result = await app.invoke('remove_from_cron', { remoteName: 'foo' });
+    assert.equal(result.success, true, result.message);
+    assert.match(result.message, /left unchanged/);
+    assert.equal(app.state.cron, `${manualFoo}\n`);
+});
+
+test('get_cron_entries lists managed and manual lines separately, and degrades when crontab is unavailable', async t => {
+    const app = createApp(t);
+    app.state.cron = `${manualFoo}\n${fooCron}0 3 * * * /usr/bin/backup.sh\n`;
+    const entries = await app.invoke('get_cron_entries', { remoteName: 'foo' });
+    assert.equal(entries.status, 'ok');
+    assert.deepEqual([...entries.managed], [fooCron.trimEnd()]);
+    assert.deepEqual([...entries.manual], [manualFoo]);
+
+    app.state.cronMode = 'denied';
+    const denied = await app.invoke('get_cron_entries', { remoteName: 'foo' });
+    assert.equal(denied.status, 'unavailable');
+    assert.match(denied.note, /denied/);
+});
+
+test('delete never removes a hand-written entry unless it was explicitly selected, and always warns about the ones it keeps', async t => {
+    const app = createApp(t);
+    const other = '30 4 * * * rclone mount foo: /mnt/second';
+    app.state.cron = `${manualFoo}\n${other}\n${fooCron}`;
+
+    const kept = await app.invoke('delete_remote', { remoteName: 'foo' });
+    assert.equal(kept.success, true, kept.message);
+    assert.match(kept.message, /written by hand were left in place \(2\)/);
+    assert.equal(app.state.cron, `${manualFoo}\n${other}\n`, 'only the managed line was removed');
+
+    const app2 = createApp(t);
+    app2.state.cron = `${manualFoo}\n${other}\n${fooCron}`;
+    const chosen = await app2.invoke('delete_remote', { remoteName: 'foo', removeManualCron: [other] });
+    assert.equal(chosen.success, true, chosen.message);
+    assert.equal(app2.state.cron, `${manualFoo}\n`, 'only the managed line and the selected manual line were removed');
+    assert.match(chosen.message, /left in place \(1\)/);
+});
+
+test('delete refuses selected lines that are not hand-written entries of this remote, before touching anything', async t => {
+    const app = createApp(t);
+    app.mount('foo');
+    const unrelated = '0 3 * * * /usr/bin/backup.sh';
+    app.state.cron = `${unrelated}\n${fooCron}`;
+    const before = app.readConfig();
+    for (const bad of [unrelated, fooCron.trimEnd(), '@reboot rclone mount prefixfoo: /x']) {
+        const result = await app.invoke('delete_remote', { remoteName: 'foo', removeManualCron: [bad] });
+        assert.equal(result.success, false, bad);
+        assert.equal(result.code, 'CRON_LINE_NOT_ELIGIBLE', bad);
+    }
+    assert.equal((await app.invoke('delete_remote', { remoteName: 'foo', removeManualCron: 'not a list' })).code, 'INVALID_ARGUMENT');
+    assert.equal(app.readConfig(), before);
+    assert.equal(app.state.cron, `${unrelated}\n${fooCron}`);
+    assert.equal(app.state.mounts.has('foo'), true, 'refused in pre-flight: the mount is untouched');
+});
+
+test('enabling auto-mount writes a v2-marked line that survives a % in the config path', async t => {
+    const app = createApp(t);
+    const result = await app.invoke('add_to_cron', { remoteName: 'foo', configPathOpt: '/home/u/100%/rclone.conf' });
+    assert.equal(result.success, true, result.message);
+    assert.match(app.state.cron, /# de_rclone:v2 remote=Zm9v\n$/);
+    assert.ok(app.state.cron.includes('100\\%'), 'every % is escaped for cron');
+    assert.equal((await app.invoke('get_remotes')).find(r => r.name === 'foo').cron_state, 'managed');
+    assert.equal((await app.invoke('remove_from_cron', { remoteName: 'foo' })).success, true);
+    assert.equal(app.state.cron, '');
 });
 
 test('enabling auto-mount without crontab access fails clearly and writes nothing', async t => {
@@ -525,13 +619,63 @@ test('legacy unmount refuses anything the mount table does not list as a legacy 
     assert.deepEqual(app.state.foreignMounts.map(m => m.mountPoint), [sshfsMount]);
 });
 
-test('removing legacy cron entries without crontab access is a warning, not a crash', async t => {
+test('legacy cron removal touches only the exact lines selected, never other legacy or unrelated lines', async t => {
     const app = createApp(t);
+    const home = app.dir;
+    const legacy = (n) => `@reboot rclone mount r${n}: ${home}/mnt/r${n}/ --daemon`;
+    const unrelated = '0 3 * * * /usr/bin/backup.sh\n# rclone mount r1: ~/mnt/ is mentioned here only in a comment\n';
+    app.state.cron = `${unrelated}${legacy(1)}\n${legacy(2)}\n${legacy(3)}\n`;
+
+    const state = await app.invoke('check_legacy_state');
+    assert.deepEqual([...state.legacyCrons], [legacy(1), legacy(2), legacy(3)]);
+
+    const result = await app.invokeRaw('remove_legacy_crons', [legacy(2)]);
+    assert.deepEqual([result.success, result.count], [true, 1]);
+    assert.equal(app.state.cron, `${unrelated}${legacy(1)}\n${legacy(3)}\n`);
+
+    // A selected line that is not a legacy entry is refused even if it exists.
+    const refused = await app.invokeRaw('remove_legacy_crons', ['0 3 * * * /usr/bin/backup.sh']);
+    assert.equal(refused.success, false);
+    assert.match(app.state.cron, /backup\.sh/);
+});
+
+test('legacy cron removal fails closed on bad input, vanished entries and an unavailable crontab', async t => {
+    const app = createApp(t);
+    const before = '0 3 * * * /usr/bin/backup.sh\n';
+    app.state.cron = before;
+    for (const bad of [undefined, 'a line', { 0: 'x' }, [1, 2]]) {
+        assert.equal((await app.invokeRaw('remove_legacy_crons', bad)).success, false);
+    }
+    const vanished = await app.invokeRaw('remove_legacy_crons', [`@reboot rclone mount x: ${app.dir}/mnt/x/ --daemon`]);
+    assert.equal(vanished.success, false);
+    assert.match(vanished.error, /no longer/);
+    assert.equal(app.state.cron, before);
+
     app.state.cronMode = 'denied';
-    const result = await app.invoke('remove_legacy_crons');
-    assert.equal(result.success, true);
-    assert.equal(result.count, 0);
-    assert.match(result.warning, /unavailable/);
+    const denied = await app.invokeRaw('remove_legacy_crons', [`@reboot rclone mount x: ${app.dir}/mnt/x/ --daemon`]);
+    assert.equal(denied.success, false);
+    assert.match(denied.error, /unavailable/);
+    assert.equal(app.cronWrites().length, 0);
+});
+
+test('legacy unmount reports every item with its reason and never touches unselected mounts', async t => {
+    const app = createApp(t);
+    const legacy = path.join(app.dir, 'mnt');
+    fs.mkdirSync(legacy);
+    const a = path.join(legacy, 'a');
+    const b = path.join(legacy, 'b');
+    app.state.foreignMounts.push(
+        { mountPoint: a, fsType: 'fuse.rclone', source: '/srv/a' },
+        { mountPoint: b, fsType: 'fuse.rclone', source: '/srv/b' }
+    );
+    const listed = await app.invoke('check_legacy_state');
+    assert.deepEqual([...listed.mountDetails].map(d => [d.path, d.source]), [[a, '/srv/a'], [b, '/srv/b']]);
+
+    const result = await app.invokeRaw('unmount_legacy_mounts', [a, '/etc/not-a-mount']);
+    assert.equal(result.success, false);
+    assert.deepEqual([...result.results].map(r => [r.path, r.ok]), [[a, true], ['/etc/not-a-mount', false]]);
+    assert.match(result.results[1].error, /not a legacy rclone mount/);
+    assert.deepEqual(app.state.foreignMounts.map(m => m.mountPoint), [b], 'the unselected mount stays mounted');
 });
 
 // --- #5 encrypted config and validated writes -------------------------------

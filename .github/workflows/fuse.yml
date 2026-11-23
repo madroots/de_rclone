@@ -1,0 +1,41 @@
+name: Real FUSE tests (experimental)
+
+on:
+  pull_request:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuse:
+    name: Real FUSE tests (experimental)
+    runs-on: ubuntu-latest
+    # [INFERENCE] FUSE availability on GitHub-hosted runners is unverified, so a
+    # failure here must not block merging. The tests themselves are not
+    # best-effort: when the job runs, every scenario has to pass.
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: 24
+
+    - name: Install FUSE, rclone and fuse-overlayfs
+      run: sudo apt-get update && sudo apt-get install -y fuse3 rclone fuse-overlayfs
+
+    - name: Show FUSE environment
+      run: |
+        ls -l /dev/fuse
+        rclone version
+        fusermount3 -V
+
+    - name: Real FUSE scenarios
+      env:
+        DE_RCLONE_REAL_FUSE: '1'
+      run: node --test test/fuse/*.test.cjs

@@ -1,8 +1,9 @@
 {
   "name": "de_rclone",
-  "version": "1.2.9",
+  "version": "1.3.0",
   "description": "Rclone GUI Manager",
   "main": "main.js",
+  "desktopName": "de_rclone.desktop",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/madroots/de_rclone.git"
@@ -10,13 +11,18 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "check": "node --check main.js && node --check preload.js && node --check renderer/app.js",
+    "test": "node --test test/*.test.cjs",
+    "test:fuse": "DE_RCLONE_REAL_FUSE=1 node --test test/fuse/*.test.cjs",
+    "mutation": "node scripts/mutation-check.cjs",
+    "release:gate": "node scripts/release-gate.cjs"
   },
   "author": "madroots",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.9.1"
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0"
   },
   "build": {
     "appId": "com.derclone.manager",
@@ -26,17 +32,29 @@
         "AppImage"
       ],
       "category": "Utility",
+      "syncDesktopName": true,
       "icon": "icon.png"
     },
     "files": [
-      "**/*",
-      "renderer/**/*"
+      "main.js",
+      "lib/**/*.js",
+      "preload.js",
+      "package.json",
+      "LICENSE",
+      "icon.png",
+      "renderer/index.html",
+      "renderer/app.js",
+      "renderer/*.css",
+      "renderer/*.svg",
+      "renderer/*.ttf",
+      "plugins/**/*"
     ],
     "publish": [
       {
         "provider": "github",
         "owner": "madroots",
-        "repo": "de_rclone"
+        "repo": "de_rclone",
+        "releaseType": "draft"
       }
     ]
   }

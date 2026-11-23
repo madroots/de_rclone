@@ -11,6 +11,33 @@ let selectedRemote = null;
 // Operation tracking to prevent multiple simultaneous operations
 let isOperationInProgress = false;
 
+// Electron prefixes errors thrown by IPC handlers with "Error invoking remote
+// method '<name>': Error: "; handlers prefix their own typed errors with
+// "CODE: ". These helpers expose the readable text and the code.
+function cleanIpcError(error) {
+  const raw = error && typeof error === 'object' && error.message ? error.message : String(error);
+  return raw.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
+}
+
+function stripErrorCode(message) {
+  return message.replace(/^[A-Z][A-Z_]+: /, '');
+}
+
+// Remove a remote that this session just created. The backend only accepts
+// rollback for names it created itself, and the result is always checked: a
+// silent failure would leave a remote the user believes was discarded.
+async function rollbackNewRemote(remoteName, configPath) {
+  try {
+    const result = await invoke('delete_remote', { remoteName, configPathOpt: configPath, rollback: true });
+    if (result && result.success) return true;
+    showGeneralModal('Error', `Could not remove the new remote '${escapeHtml(remoteName)}': ${escapeHtml(result?.message || 'unknown error')}<br><br>It is still in your rclone config. Delete it from the right-click menu.`);
+  } catch (error) {
+    showGeneralModal('Error', `Could not remove the new remote '${escapeHtml(remoteName)}': ${escapeHtml(stripErrorCode(cleanIpcError(error)))}<br><br>It is still in your rclone config. Delete it from the right-click menu.`);
+  }
+  await loadRemotes();
+  return false;
+}
+
 // Escape values that come from rclone.conf before inserting them into HTML.
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -120,34 +147,38 @@ async function checkLegacyState() {
     const state = await invoke('check_legacy_state');
     const hasMounts = state.mounts && state.mounts.length > 0;
     const hasCrons = state.legacyCrons && state.legacyCrons.length > 0;
-    
+
     if (hasMounts || hasCrons) {
-      showLegacyStateWarning(state.mounts || [], state.legacyCrons || []);
+      showLegacyStateWarning(state);
     }
   } catch (e) {
     console.error("Failed to check legacy state:", e);
   }
 }
 
-function showLegacyStateWarning(mounts, crons) {
+// Lists leftovers of the old ~/mnt setup. Nothing is selected by default and
+// nothing is removed unless the user ticks that exact item and confirms.
+function showLegacyStateWarning(state) {
+  const mounts = state.mountDetails || (state.mounts || []).map(path => ({ path, source: '' }));
+  const crons = state.legacyCrons || [];
   const modal = document.createElement('div');
   modal.className = 'progress-modal';
-  
+
+  const notes = [state.mountsError && `mounts: ${state.mountsError}`, state.cronNote && `crontab: ${state.cronNote}`].filter(Boolean);
   let detailsHtml = '';
   if (mounts.length > 0) {
     detailsHtml += `
-      <strong>Active Mounts (~/mnt):</strong>
-      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 80px; overflow-y: auto;">
-        ${mounts.map(m => `<li>${escapeHtml(m)}</li>`).join('')}
+      <strong>rclone mounts in ~/mnt:</strong>
+      <ul style="list-style: none; padding: 0; margin: 5px 0 10px; max-height: 100px; overflow-y: auto;">
+        ${mounts.map((m, i) => `<li><label><input type="checkbox" class="legacy-mount" data-index="${i}"> ${escapeHtml(m.path)}${m.source ? ` <span class="text-muted">(${escapeHtml(m.source)})</span>` : ''}</label></li>`).join('')}
       </ul>
     `;
   }
   if (crons.length > 0) {
     detailsHtml += `
-      <strong>Legacy Auto-mounts (Cron):</strong>
-      <ul style="margin-top: 5px; margin-bottom: 10px; max-height: 120px; overflow-y: auto;">
-        <li>Found ${crons.length} legacy cron entry(s):</li>
-        ${crons.map(entry => `<li style="font-family: monospace; font-size: 0.85em; word-break: break-all;">${escapeHtml(entry)}</li>`).join('')}
+      <strong>Legacy auto-mount entries (cron):</strong>
+      <ul style="list-style: none; padding: 0; margin: 5px 0 10px; max-height: 120px; overflow-y: auto;">
+        ${crons.map((entry, i) => `<li><label style="font-family: monospace; font-size: 0.85em; word-break: break-all;"><input type="checkbox" class="legacy-cron" data-index="${i}"> ${escapeHtml(entry)}</label></li>`).join('')}
       </ul>
     `;
   }
@@ -158,17 +189,16 @@ function showLegacyStateWarning(mounts, crons) {
         <span class="progress-title">Legacy Setup Detected</span>
       </div>
       <div class="progress-body" style="padding: 15px;">
-        <div class="progress-message" style="margin-bottom: 15px;">
+        <div class="progress-message" id="legacy-body" style="margin-bottom: 15px;">
           The mount location has been updated to $XDG_RUNTIME_DIR.<br/><br/>
-          We detected parts of the old setup that should be cleaned up:
+          These parts of the old setup are still present. Tick only the items you want removed:
           <div style="margin-top: 10px; font-size: 0.9em; text-align: left;">
             ${detailsHtml}
           </div>
-          <br/>
-          Would you like to clean them up now?
+          ${notes.length ? `<div class="text-muted" style="font-size: 0.85em;">${notes.map(escapeHtml).join('<br/>')}</div>` : ''}
         </div>
         <div class="progress-content" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
-          <button class="cs-btn" id="legacy-cleanup-btn">Clean Up All</button>
+          <button class="cs-btn" id="legacy-cleanup-btn" disabled>Remove selected</button>
           <button class="cs-btn" id="legacy-ignore-btn">Ignore</button>
         </div>
       </div>
@@ -177,31 +207,55 @@ function showLegacyStateWarning(mounts, crons) {
 
   document.body.appendChild(modal);
 
-  document.getElementById('legacy-cleanup-btn').addEventListener('click', async () => {
-    const cleanupBtn = document.getElementById('legacy-cleanup-btn');
+  const cleanupBtn = document.getElementById('legacy-cleanup-btn');
+  const selected = () => ({
+    mounts: [...modal.querySelectorAll('.legacy-mount:checked')].map(el => mounts[Number(el.dataset.index)].path),
+    crons: [...modal.querySelectorAll('.legacy-cron:checked')].map(el => crons[Number(el.dataset.index)])
+  });
+  const refreshButton = () => {
+    const { mounts: m, crons: c } = selected();
+    cleanupBtn.disabled = m.length + c.length === 0;
+    cleanupBtn.textContent = m.length + c.length === 0 ? 'Remove selected' : `Remove selected (${m.length + c.length})`;
+  };
+  modal.querySelectorAll('input[type="checkbox"]').forEach(el => el.addEventListener('change', refreshButton));
+
+  cleanupBtn.addEventListener('click', async () => {
+    const pick = selected();
     cleanupBtn.disabled = true;
-    cleanupBtn.textContent = "Cleaning...";
-    let success = true;
+    cleanupBtn.textContent = 'Removing...';
+    const lines = [];
+    let allOk = true;
 
     try {
-      if (mounts.length > 0) {
-        const mountResult = await invoke('unmount_legacy_mounts', mounts);
-        if (!mountResult.success) success = false;
+      if (pick.mounts.length > 0) {
+        const result = await invoke('unmount_legacy_mounts', pick.mounts);
+        for (const item of result.results || []) {
+          lines.push(`${item.ok ? 'Unmounted' : 'FAILED'}: ${item.path}${item.ok ? '' : ` (${item.error})`}`);
+        }
+        if (!result.success) {
+          allOk = false;
+          if (result.error) lines.push(`FAILED: ${result.error}`);
+        }
       }
-      if (crons.length > 0) {
-        const cronResult = await invoke('remove_legacy_crons');
-        if (!cronResult.success) success = false;
-      }
-
-      if (success) {
-        showStatus("Successfully cleaned up legacy setup.", "success");
-      } else {
-        showStatus("Some legacy components failed to clean up.", "warning");
+      if (pick.crons.length > 0) {
+        const result = await invoke('remove_legacy_crons', pick.crons);
+        if (result.success) {
+          lines.push(`Removed ${result.count} cron entr${result.count === 1 ? 'y' : 'ies'}`);
+        } else {
+          allOk = false;
+          lines.push(`FAILED: cron entries (${result.error || 'unknown error'})`);
+        }
       }
     } catch (e) {
-      showStatus("Failed during legacy cleanup: " + e.message, "error");
+      allOk = false;
+      lines.push(`FAILED: ${stripErrorCode(cleanIpcError(e))}`);
     }
-    modal.remove();
+
+    showStatus(allOk ? 'Removed the selected legacy items.' : 'Some selected legacy items could not be removed.', allOk ? 'success' : 'warning');
+    document.getElementById('legacy-body').innerHTML = lines.map(escapeHtml).join('<br/>');
+    modal.querySelector('.progress-content').innerHTML = '<button class="cs-btn" id="legacy-done-btn">OK</button>';
+    document.getElementById('legacy-done-btn').addEventListener('click', () => modal.remove());
+    loadRemotes();
   });
 
   document.getElementById('legacy-ignore-btn').addEventListener('click', () => {
@@ -310,26 +364,32 @@ async function loadRemotes() {
       }
     }
 
-    const message = `Loaded ${remotes.length} remotes`;
+    const cronNotes = [...new Set(remotes.map(r => r.cron_note).filter(Boolean))];
+    const message = `Loaded ${remotes.length} remotes${cronNotes.length ? ` (${cronNotes.join('; ')})` : ''}`;
     defaultStatusMessage = message; // Update the default message
     showStatus(message, 'success', false); // Don't auto-reset the loaded message
   } catch (error) {
     console.error('Error loading remotes:', error);
-    // Handle error safely to avoid undefined error.message
-    const errorMessage = error && typeof error === 'object' && error.message ? error.message : String(error);
-    const displayMessage = `Error loading remotes: ${errorMessage}`;
-    // Don't reset defaultStatusMessage if it's the config not found specific message
-    if (!errorMessage.includes("rclone.conf not found")) {
-      defaultStatusMessage = "Ready"; // Reset to ready state on other errors
-    }
-    showStatus(displayMessage, 'error');
+    const errorMessage = cleanIpcError(error);
 
-    // Specific error message for common issues
-    if (errorMessage && errorMessage.includes("rclone.conf not found")) {
-      showStatus("rclone.conf not found. Select it from settings or add a new remote to create it.", 'warning', false); // Yellow and doesn't auto-reset
-      defaultStatusMessage = "rclone.conf not found. Select it from settings or add a new remote to create it."; // Keep this as the persistent message
-    } else if (errorMessage && errorMessage.includes("Failed to read config")) {
-      showStatus("Could not read rclone config. Check ~/.config/rclone/rclone.conf", 'warning', false); // Yellow and doesn't auto-reset
+    // Never leave rows from an earlier load on screen: they would pass for the
+    // current state of a config that can no longer be read.
+    if (remoteTableBody) remoteTableBody.innerHTML = '';
+    updateRemoteHeader(0);
+    selectedRemote = null;
+    updateButtonStates(null);
+
+    if (errorMessage.includes('rclone.conf not found')) {
+      const text = 'rclone.conf not found. Select it from settings or add a new remote to create it.';
+      showStatus(text, 'warning', false); // Yellow and doesn't auto-reset
+      defaultStatusMessage = text; // Keep this as the persistent message
+    } else if (errorMessage.startsWith('CONFIG_ENCRYPTED:')) {
+      const text = stripErrorCode(errorMessage);
+      showStatus(text, 'warning', false);
+      defaultStatusMessage = text;
+    } else {
+      defaultStatusMessage = 'Ready';
+      showStatus(`Error loading remotes: ${stripErrorCode(errorMessage)}`, 'error');
     }
   }
 }
@@ -383,7 +443,7 @@ async function renderRemotesTable(remotes) {
       <td>${escapeHtml(remote.mounted)}</td>
       <td>${escapeHtml(remote.cron)}</td>
       <td>${escapeHtml(remote.mount_point)}</td>
-      <td><span id="latency-${escapeHtml(remote.name)}" class="text-muted">...</span></td>
+      <td><span class="latency text-muted">...</span></td>
     `;
 
     row.addEventListener('click', () => {
@@ -419,33 +479,35 @@ async function renderRemotesTable(remotes) {
     remoteTableBody.appendChild(row);
 
     // Trigger latency check immediately
-    checkLatency(remote.name);
+    checkLatency(remote.name, row.querySelector('.latency'));
   });
 }
 
-async function checkLatency(remoteName) {
-  const el = document.getElementById(`latency-${remoteName}`);
+async function checkLatency(remoteName, el) {
   if (!el) return;
 
   // Set minimal text
   el.textContent = '...';
+  el.title = '';
 
   try {
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     const result = await invoke('check_latency', { remoteName, configPathOpt: configPath });
 
     if (result.success) {
-      el.textContent = `${result.latency}ms`;
+      el.textContent = result.latency < 1000 ? `${result.latency}ms` : `${(result.latency / 1000).toFixed(1)}s`;
       // Set color directly using style to avoid CSS parsing issues in some contexts
       if (result.latency < 200) el.style.color = '#38b038'; // Greenish
       else if (result.latency < 1000) el.style.color = '#c4b550'; // Yellowish
       else el.style.color = '#ff6b6b'; // Red
     } else {
-      el.textContent = result.error === 'Timeout' ? 'Timeout' : 'Error';
+      el.textContent = result.timeout ? 'Timeout' : 'Error';
+      el.title = result.error || '';
       el.style.color = '#ff6b6b';
     }
   } catch (e) {
     el.textContent = 'Error';
+    el.title = stripErrorCode(cleanIpcError(e));
     el.style.color = '#ff6b6b';
   }
 }
@@ -467,15 +529,22 @@ function updateRemoteHeader(count) {
 function updateButtonStates(remote) {
   // Reset all buttons to disabled initially
   if (mountBtn) mountBtn.disabled = true;
-  if (unmountBtn) unmountBtn.disabled = true;
+  if (unmountBtn) {
+    unmountBtn.disabled = true;
+    unmountBtn.textContent = 'Unmount';
+  }
   if (openBtn) openBtn.disabled = true;
   if (testBtn) testBtn.disabled = true;
 
   // Only enable buttons if a remote is selected
   if (remote) {
-    if (mountBtn) mountBtn.disabled = remote.mounted === 'Yes';
-    if (unmountBtn) unmountBtn.disabled = remote.mounted !== 'Yes';
-    if (openBtn) openBtn.disabled = remote.mounted !== 'Yes';
+    const state = remote.mount_state || (remote.mounted === 'Yes' ? 'mounted' : 'unmounted');
+    if (mountBtn) mountBtn.disabled = state !== 'unmounted';
+    if (unmountBtn) {
+      unmountBtn.disabled = state !== 'mounted' && state !== 'stale';
+      unmountBtn.textContent = state === 'stale' ? 'Recover' : 'Unmount';
+    }
+    if (openBtn) openBtn.disabled = state !== 'mounted';
     if (testBtn) testBtn.disabled = false;
   }
 }
@@ -535,12 +604,14 @@ async function mountSelected() {
   resetOperationCancellation(); // Reset cancellation flag
 
   // Show progress modal with cancel button
-  const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Cancel', remoteName, 'mount');
+  const modal = showProgressDialog(`Mounting ${remoteName}...`, 'Please wait...', remoteName, 'mount');
 
   try {
-    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
+    // The backend waits for rclone's own mount readiness (up to 60s) and reports
+    // the real outcome; this guard must outlast it so the UI never reports a
+    // timeout for a mount that is still going to succeed.
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Mount operation timed out after 10 seconds')), 10000);
+      setTimeout(() => reject(new Error('Mount operation timed out after 70 seconds')), 70000);
     });
 
     // Get the config path from localStorage or use default (null)
@@ -614,22 +685,25 @@ async function unmountSelected() {
   }
 
   const remoteName = selectedRemote.name;
+  const recovering = selectedRemote.mount_state === 'stale';
   resetOperationCancellation(); // Reset cancellation flag
 
   // Show progress modal with cancel button
-  const modal = showProgressDialog(`Unmounting ${remoteName}...`, 'Cancel', remoteName, 'unmount');
+  const modal = showProgressDialog(`${recovering ? 'Recovering' : 'Unmounting'} ${remoteName}...`, 'Please wait...', remoteName, 'unmount');
 
   try {
-    // Create a timeout promise that rejects after 10 seconds to match test connection timeout
+    // The backend owns the real timeouts (each unmount tool is bounded, worst case
+    // about 75s); this guard only outlasts them so the UI never reports a timeout
+    // for something that is still going to finish.
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Unmount operation timed out after 10 seconds')), 10000);
+      setTimeout(() => reject(new Error('Unmount operation timed out after 100 seconds')), 100000);
     });
 
     // Get the config path from localStorage or use default (null)
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('unmount_remote', { remoteName, configPathOpt: configPath }),
+      invoke(recovering ? 'recover_mount' : 'unmount_remote', { remoteName, configPathOpt: configPath }),
       timeoutPromise
     ]);
 
@@ -722,6 +796,7 @@ async function testSelected() {
 
   // Show progress modal with cancel button
   const modal = showProgressDialog(`Testing connection to ${remoteName}...`, 'Cancel', remoteName, 'test');
+  modal.operation.requestId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now() + Math.random());
 
   try {
     // Create a timeout promise that rejects after 15 seconds (backend caps at 12s)
@@ -733,7 +808,7 @@ async function testSelected() {
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     // Race the invoke call with the timeout
     const result = await Promise.race([
-      invoke('test_connection', { remoteName, configPathOpt: configPath }),
+      invoke('test_connection', { remoteName, configPathOpt: configPath, requestId: modal.operation.requestId }),
       timeoutPromise
     ]);
 
@@ -804,6 +879,10 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
     operationMessage = `Establishing network connection to ${remoteName}...`;
   }
 
+  // Mount and unmount cannot be cancelled once started (rclone has forked its
+  // daemon / the unmount tool is running), so the button stays disabled until the
+  // real result arrives instead of claiming a cancellation that did not happen.
+  const locked = operationType === 'mount' || operationType === 'unmount';
   modal.innerHTML = `
     <div class="progress-modal-content">
       <div class="progress-header">
@@ -815,7 +894,7 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
           <div class="cs-progress-bar" style="flex: 1;">
             <div class="bars" style="width: 1%"></div>
           </div>
-          <button class="cs-btn progress-cancel-btn">${cancelText}</button>
+          <button class="cs-btn progress-cancel-btn" ${locked ? 'disabled' : ''}>${cancelText}</button>
         </div>
       </div>
     </div>
@@ -836,6 +915,10 @@ function showProgressDialog(message, cancelText, remoteName, operationType) {
   cancelBtn.addEventListener('click', () => {
     modal.operation.cancelled = true;
     cancelCurrentOperation();
+    // A connection test is really cancelled: the backend kills its rclone process.
+    if (modal.operation.type === 'test' && modal.operation.requestId) {
+      invoke('cancel_test', { requestId: modal.operation.requestId }).catch(() => { });
+    }
     // Update the modal immediately to show cancellation
     updateProgressModal(modal, 'Cancelled', 'Operation was cancelled', 'OK', 'cancelled');
   });
@@ -856,6 +939,7 @@ function updateProgressModal(modal, title, message, buttonText, resultType) {
   titleElement.textContent = title;
   messageElement.textContent = message;
   cancelButton.textContent = buttonText;
+  cancelButton.disabled = false;
 
   // Make the progress bar jump to 100% in all scenarios and keep it visible
   if (progressBar) {
@@ -1228,7 +1312,7 @@ async function addRemote() {
         }
 
         if (addCancelled) {
-          await invoke('delete_remote', { remoteName, configPathOpt: configPath }).catch(() => {});
+          await rollbackNewRemote(remoteName, configPath);
           return;
         }
 
@@ -1248,7 +1332,7 @@ async function addRemote() {
 
         // If the user cancelled while the test was running, remove the new remote.
         if (addCancelled) {
-          await invoke('delete_remote', { remoteName, configPathOpt: configPath }).catch(() => {});
+          await rollbackNewRemote(remoteName, configPath);
           return;
         }
 
@@ -1272,15 +1356,16 @@ async function addRemote() {
           await loadRemotes(); // Refresh the list
         } else {
           // The remote is written before the test; remove it when the user declines.
-          const deleted = await invoke('delete_remote', { remoteName, configPathOpt: configPath });
-          if (!deleted.success) {
-            showGeneralModal('Error', `Could not remove the new remote: ${deleted.message}`);
-          }
-          showStatus('Connection test failed. The remote was not saved.', 'warning');
+          const removed = await rollbackNewRemote(remoteName, configPath);
+          showStatus(
+            removed ? 'Connection test failed. The remote was not saved.'
+              : 'Connection test failed, and the new remote could not be removed.',
+            'warning'
+          );
         }
       } catch (error) {
         console.error('Error adding remote:', error);
-        showGeneralModal('Error', `Failed to add remote: ${error.message || error}`);
+        showGeneralModal('Error', `Failed to add remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
       } finally {
         if (document.contains(this)) {
           this.disabled = false;
@@ -1412,9 +1497,11 @@ function createContextMenu(x, y, remote) {
   menu.style.minWidth = '200px';
   menu.style.maxWidth = '250px';
 
-  // Determine cron action
-  const isCron = remote.cron === "Yes";
-  const cronAction = isCron ? "Disable auto-mount" : "Enable auto-mount";
+  // 'managed' = written by de_rclone; 'manual' = the user's own cron entry, which
+  // de_rclone reports but never edits; anything else offers to enable auto-mount.
+  const cronState = remote.cron_state || (remote.cron === 'Yes' ? 'managed' : 'none');
+  const isCron = cronState === 'managed';
+  const cronAction = isCron ? 'Disable auto-mount' : cronState === 'manual' ? 'Auto-mount: written by hand' : 'Enable auto-mount';
   const cronIcon = isCron ? '<img src="cron_icon.svg" style="width: 16px; height: 16px; vertical-align: bottom; margin-right: 8px;">' : '<img src="cron_icon.svg" style="width: 16px; height: 16px; vertical-align: bottom; margin-right: 8px; opacity: 0.5;">';
 
   // Create menu content with proper CS16 styling
@@ -1444,6 +1531,12 @@ function createContextMenu(x, y, remote) {
   document.getElementById('menu-cron').addEventListener('click', async () => {
     menu.remove();
     try {
+      if (cronState === 'manual') {
+        const entries = await invoke('get_cron_entries', { remoteName: remote.name });
+        const lines = (entries.manual || []).map(line => `<div style="font-family: monospace; font-size: 0.85em; word-break: break-all; margin-top: 6px;">${escapeHtml(line)}</div>`).join('');
+        showGeneralModal('Auto-mount written by hand', `This remote is mounted at boot by a cron entry you wrote yourself. de_rclone will not change it; edit it with <code>crontab -e</code>.${lines}`);
+        return;
+      }
       const action = isCron ? 'remove_from_cron' : 'add_to_cron';
       const configPath = localStorage.getItem('rcloneConfigPath') || null;
 
@@ -1455,13 +1548,13 @@ function createContextMenu(x, y, remote) {
       });
 
       if (result.success) {
-        showStatus(result.message, 'success');
+        showStatus(result.message, result.warning ? 'warning' : 'success');
         await loadRemotes(); // Refresh table to show updated status
       } else {
-        showGeneralModal('Error', result.message);
+        showGeneralModal('Error', escapeHtml(result.message));
       }
     } catch (e) {
-      showGeneralModal('Error', `Operation failed: ${e.message || e}`);
+      showGeneralModal('Error', `Operation failed: ${escapeHtml(stripErrorCode(cleanIpcError(e)))}`);
     }
   });
 
@@ -1521,7 +1614,7 @@ async function handleEditRemote(remote) {
     if (error.message?.includes("not found in config")) {
       showGeneralModal('Error', `Remote '${remote.name}' not found in the config file anymore.`);
     } else {
-      showGeneralModal('Error', `Failed to edit remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to edit remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     }
   }
 }
@@ -1624,7 +1717,7 @@ async function openEditRemoteForm(remote, plugin, remoteConfig) {
       await loadRemotes(); // Refresh the list
     } catch (error) {
       console.error('Error updating remote:', error);
-      showGeneralModal('Error', `Failed to update remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to update remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     } finally {
       if (document.contains(saveBtn)) {
         saveBtn.disabled = false;
@@ -1690,29 +1783,65 @@ function loadPluginFieldsForEdit(plugin, remoteConfig) {
   }
 }
 
-// Handle deleting a remote
+// Handle deleting a remote. Hand-written cron entries for the remote are listed
+// with unchecked boxes: they are only removed when explicitly ticked, and the
+// result always says which ones were kept.
 async function handleDeleteRemote(remote) {
-  showConfirmModal('Delete Remote', `Are you sure you want to delete remote '${escapeHtml(remote.name)}'?\n\nThis action cannot be undone.`, async () => {
+  let manualLines = [];
+  try {
+    const entries = await invoke('get_cron_entries', { remoteName: remote.name });
+    if (entries && entries.status === 'ok') manualLines = entries.manual || [];
+  } catch (e) {
+    console.error('Could not list cron entries before delete:', e);
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'progress-modal';
+  modal.innerHTML = `
+    <div class="progress-modal-content">
+      <div class="progress-header"><span class="progress-title">Delete Remote</span></div>
+      <div class="progress-body">
+        <div class="progress-message">
+          Delete remote '${escapeHtml(remote.name)}'?<br><br>
+          This will unmount its managed mount and disable its de_rclone auto-mount before removing its configuration. If cleanup fails, the configuration is kept so you can retry.
+          ${manualLines.length ? `<br><br><strong>Cron entries written by hand for this remote.</strong> They are kept unless you tick them:
+            <ul style="list-style: none; padding: 0; margin: 6px 0; max-height: 110px; overflow-y: auto;">
+              ${manualLines.map((line, i) => `<li><label style="font-family: monospace; font-size: 0.85em; word-break: break-all;"><input type="checkbox" class="delete-manual-cron" data-index="${i}"> ${escapeHtml(line)}</label></li>`).join('')}
+            </ul>` : ''}
+          <br><br>This action cannot be undone.
+        </div>
+        <div class="progress-content" style="justify-content: flex-end; padding-top: 10px;">
+          <button class="cs-btn" id="delete-cancel-btn" style="margin-right: 5px;">Cancel</button>
+          <button class="cs-btn" id="delete-ok-btn">Delete</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  document.getElementById('delete-cancel-btn').addEventListener('click', () => modal.remove());
+  document.getElementById('delete-ok-btn').addEventListener('click', async () => {
+    const removeManualCron = [...modal.querySelectorAll('.delete-manual-cron:checked')].map(el => manualLines[Number(el.dataset.index)]);
+    modal.remove();
     try {
       // Get the config path from localStorage or use default (null)
       const configPath = localStorage.getItem('rcloneConfigPath') || null;
 
-      // Call the backend to delete the remote
       const result = await invoke('delete_remote', {
         remoteName: remote.name,
-        configPathOpt: configPath
+        configPathOpt: configPath,
+        removeManualCron
       });
 
       if (result.success) {
-        showGeneralModal('Success', result.message);
+        showGeneralModal('Success', escapeHtml(result.message));
         // Reload remotes to reflect the change
         await loadRemotes();
       } else {
-        showGeneralModal('Error', result.message);
+        showGeneralModal('Error', escapeHtml(result.message));
       }
     } catch (error) {
       console.error('Error deleting remote:', error);
-      showGeneralModal('Error', `Failed to delete remote: ${error.message || error}`);
+      showGeneralModal('Error', `Failed to delete remote: ${escapeHtml(stripErrorCode(cleanIpcError(error)))}`);
     }
   });
 }

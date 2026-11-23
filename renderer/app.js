@@ -443,7 +443,7 @@ async function renderRemotesTable(remotes) {
       <td>${escapeHtml(remote.mounted)}</td>
       <td>${escapeHtml(remote.cron)}</td>
       <td>${escapeHtml(remote.mount_point)}</td>
-      <td><span id="latency-${escapeHtml(remote.name)}" class="text-muted">...</span></td>
+      <td><span class="latency text-muted">...</span></td>
     `;
 
     row.addEventListener('click', () => {
@@ -479,33 +479,35 @@ async function renderRemotesTable(remotes) {
     remoteTableBody.appendChild(row);
 
     // Trigger latency check immediately
-    checkLatency(remote.name);
+    checkLatency(remote.name, row.querySelector('.latency'));
   });
 }
 
-async function checkLatency(remoteName) {
-  const el = document.getElementById(`latency-${remoteName}`);
+async function checkLatency(remoteName, el) {
   if (!el) return;
 
   // Set minimal text
   el.textContent = '...';
+  el.title = '';
 
   try {
     const configPath = localStorage.getItem('rcloneConfigPath') || null;
     const result = await invoke('check_latency', { remoteName, configPathOpt: configPath });
 
     if (result.success) {
-      el.textContent = `${result.latency}ms`;
+      el.textContent = result.latency < 1000 ? `${result.latency}ms` : `${(result.latency / 1000).toFixed(1)}s`;
       // Set color directly using style to avoid CSS parsing issues in some contexts
       if (result.latency < 200) el.style.color = '#38b038'; // Greenish
       else if (result.latency < 1000) el.style.color = '#c4b550'; // Yellowish
       else el.style.color = '#ff6b6b'; // Red
     } else {
-      el.textContent = result.error === 'Timeout' ? 'Timeout' : 'Error';
+      el.textContent = result.timeout ? 'Timeout' : 'Error';
+      el.title = result.error || '';
       el.style.color = '#ff6b6b';
     }
   } catch (e) {
     el.textContent = 'Error';
+    el.title = stripErrorCode(cleanIpcError(e));
     el.style.color = '#ff6b6b';
   }
 }

@@ -457,22 +457,54 @@ ipcMain.handle('cancel_test', async (event, { requestId }) => {
     return { success: true };
 });
 
-// Latency check handler
+// Latency check: wall time of a top-level listing, from spawn to exit. The
+// listing itself is discarded (a large root never fills a buffer) and stdin is
+// closed, so a remote that would prompt fails instead of hanging. The ceiling
+// is generous because a full root listing of a healthy remote (Google Drive
+// with paging and a token refresh, S3 under load) routinely takes several
+// seconds. rclone's own retries are left at their defaults: capping them turns
+// a rate-limited but healthy remote (Google Drive pacer backoff) into an error.
+const LATENCY_TIMEOUT_MS = 20000;
+const RCLONE_LOG_PREFIX_RE = /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} [A-Z]+\s*: /;
 ipcMain.handle('check_latency', async (event, { remoteName, configPathOpt }) => {
-    const configPath = getRcloneConfigPath(configPathOpt);
-    // Test connection with a timeout. lsf is lightweight.
-    // We use a shorter timeout for latency checks (3s)
     const args = ['lsf', `${remoteName}:`, '--max-depth', '1'];
-    if (configPathOpt) args.push('--config', configPath);
+    if (configPathOpt) args.push('--config', getRcloneConfigPath(configPathOpt));
 
-    const start = Date.now();
-    try {
-        await execFilePromise('rclone', args, { timeout: 3000, killSignal: 'SIGTERM' });
-        return { success: true, latency: Date.now() - start };
-    } catch (e) {
-        const timedOut = e.error?.killed || e.error?.signal === 'SIGTERM';
-        return { success: false, error: timedOut ? 'Timeout' : ((e.stderr || '').trim() || 'Error') };
-    }
+    return new Promise(resolve => {
+        const start = Date.now();
+        let stderr = '';
+        let timedOut = false;
+        let child;
+        try {
+            child = spawn('rclone', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        } catch (e) {
+            resolve({ success: false, error: e.message });
+            return;
+        }
+        const timer = setTimeout(() => {
+            timedOut = true;
+            child.kill('SIGKILL');
+        }, LATENCY_TIMEOUT_MS);
+        child.stderr.on('data', chunk => {
+            stderr = (stderr + chunk).slice(-4096);
+        });
+        child.on('error', e => {
+            clearTimeout(timer);
+            resolve({ success: false, error: e.message });
+        });
+        child.on('close', code => {
+            clearTimeout(timer);
+            if (timedOut) {
+                resolve({ success: false, timeout: true, error: `No answer within ${LATENCY_TIMEOUT_MS / 1000}s` });
+            } else if (code === 0) {
+                resolve({ success: true, latency: Date.now() - start });
+            } else {
+                const lines = stderr.trim().split('\n').filter(Boolean);
+                const error = (lines[lines.length - 1] || `rclone exited with status ${code}`).replace(RCLONE_LOG_PREFIX_RE, '');
+                resolve({ success: false, timeout: /i\/o timeout|deadline exceeded/.test(error), error });
+            }
+        });
+    });
 });
 
 ipcMain.handle('is_rclone_installed', async () => {

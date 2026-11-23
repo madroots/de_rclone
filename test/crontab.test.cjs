@@ -9,64 +9,18 @@ const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { execFile: realExecFile } = require('node:child_process');
 
-const {
-    isCronLineFor, isCronEntryFor, classifyCrontabRead, createCrontabClient, normalizeCrontabContent
-} = require('../lib/crontab');
+const { classifyCrontabRead, createCrontabClient, normalizeCrontabContent } = require('../lib/crontab');
 
-// ---------------------------------------------------------------------------
-// Matcher (moved verbatim from main.js; #7 will change it)
-// ---------------------------------------------------------------------------
-
+// Fixtures for the client tests. The line matcher itself lives in lib/cronentries.js
+// (#7); these tests only need to find the line they wrote.
 const fooCron = "@reboot rclone mount 'foo:' '/managed/foo' --daemon # Added by de_rclone: foo\n";
 const unrelatedCron = '# keep this comment about rclone mount foo:\n' +
     '@reboot rclone mount prefixfoo: /managed/prefixfoo --daemon\n' +
     '@reboot rclone mount foo:subdir /managed/subdir --daemon\n' +
     '0 1 * * * echo backup # rclone mount foo:\n' +
     '0 2 * * * echo rclone mount foo:\n';
-
-test('matcher detects the generated line and quoting/path variants for the exact remote', () => {
-    const accepted = [
-        fooCron.trim(),
-        '@reboot /usr/bin/rclone mount "foo:" /managed/foo --daemon',
-        '0 3 * * * rclone mount foo: /x',
-        '   @reboot rclone mount foo: /x',
-        '@reboot echo hi; rclone mount foo: /x',
-        '@reboot true && rclone mount foo: /x &',
-        '@reboot exec rclone mount foo: /x',
-        '@reboot rclone mount foo: /x\r',
-        '@reboot rclone mount foo\\: /x',
-    ];
-    for (const line of accepted) assert.equal(isCronLineFor(line, 'foo'), true, line);
-    assert.equal(isCronLineFor("@reboot rclone mount 'my remote:' /x", 'my remote'), true);
-});
-
-test('matcher rejects comments, prefixes, other remotes, echo and unterminated quotes', () => {
-    // 'must still be rejected' list from #7 that the current matcher already honours.
-    for (const line of unrelatedCron.split('\n').filter(Boolean)) {
-        assert.equal(isCronLineFor(line, 'foo'), false, line);
-    }
-    const rejected = [
-        '# @reboot rclone mount foo: /x',
-        '@reboot rclone mount foo2: /x',
-        '@reboot rclone mount other: foo:subdir',
-        '@reboot echo rclone mount foo:',
-        "@reboot rclone mount 'foo: /x",
-        '@reboot rclone mount foo',
-        '',
-    ];
-    for (const line of rejected) assert.equal(isCronLineFor(line, 'foo'), false, line);
-    assert.equal(isCronLineFor(fooCron.trim(), 'fo'), false);
-});
-
-test('isCronEntryFor scans every line of the table and tolerates empty input', () => {
-    assert.equal(isCronEntryFor(unrelatedCron, 'foo'), false);
-    assert.equal(isCronEntryFor(unrelatedCron + fooCron, 'foo'), true);
-    assert.equal(isCronEntryFor(unrelatedCron + fooCron, 'bar'), false);
-    assert.equal(isCronEntryFor(unrelatedCron + fooCron.replace(/\n$/, ''), 'foo'), true);
-    assert.equal(isCronEntryFor('', 'foo'), false);
-    assert.equal(isCronEntryFor(null, 'foo'), false);
-    assert.equal(isCronEntryFor(undefined, 'foo'), false);
-});
+const isCronLineFor = (line, name) => !/^\s*#/.test(line) && line.includes(`rclone mount '${name}:'`);
+const isCronEntryFor = (content, name) => String(content || '').split('\n').some(line => isCronLineFor(line, name));
 
 // ---------------------------------------------------------------------------
 // classifyCrontabRead
